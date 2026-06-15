@@ -318,6 +318,17 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             } else {
                 DispatchQueue.main.async { result(FlutterError(code: "INVALID_ARGUMENT",message: "Missing 'useFrontCamera'", details: nil)) }
             }
+        case "setZoom":
+            if let args = call.arguments as? [String: Any],
+               let zoom = args["zoom"] as? Double {
+                setZoomNative(zoomFactor: CGFloat(zoom), result: result)
+            } else {
+                DispatchQueue.main.async { result(FlutterError(code: "INVALID_ARGUMENT", message: "Missing zoom value", details: nil)) }
+            }
+        case "getMaxZoom":
+            getMaxZoomNative(result: result)
+        case "getMinZoom":
+            getMinZoomNative(result: result)
         default:
             DispatchQueue.main.async { result(FlutterMethodNotImplemented) }
         }
@@ -677,6 +688,42 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         guard !isDeinitializing else { return }
     }
     
+
+    private func setZoomNative(zoomFactor: CGFloat, result: @escaping FlutterResult) {
+        sessionQueue.async { [weak self] in
+            guard let strongSelf = self,
+                  let device = strongSelf.currentCameraInput?.device else {
+                DispatchQueue.main.async { result(FlutterError(code: "NO_CAMERA", message: "Camera not initialized", details: nil)) }
+                return
+            }
+            do {
+                try device.lockForConfiguration()
+                let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 20.0) // Cap at 20x for safety
+                let minZoom: CGFloat = 1.0
+                device.videoZoomFactor = max(minZoom, min(zoomFactor, maxZoom))
+                device.unlockForConfiguration()
+                DispatchQueue.main.async { result(nil) }
+            } catch {
+                DispatchQueue.main.async { result(FlutterError(code: "ZOOM_FAILED", message: "Failed to set zoom: \(error.localizedDescription)", details: nil)) }
+            }
+        }
+    }
+
+    private func getMaxZoomNative(result: @escaping FlutterResult) {
+        sessionQueue.async { [weak self] in
+            guard let strongSelf = self,
+                  let device = strongSelf.currentCameraInput?.device else {
+                DispatchQueue.main.async { result(1.0) }
+                return
+            }
+            let maxZoom = min(Double(device.activeFormat.videoMaxZoomFactor), 20.0)
+            DispatchQueue.main.async { result(maxZoom) }
+        }
+    }
+
+    private func getMinZoomNative(result: @escaping FlutterResult) {
+        DispatchQueue.main.async { result(1.0) }
+    }
     deinit {
         isDeinitializing = true
         let currentViewId = self.viewId

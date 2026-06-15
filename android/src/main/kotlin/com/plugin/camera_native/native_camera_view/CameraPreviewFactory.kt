@@ -255,6 +255,13 @@ class CameraPlatformView(
                     result.error("INVALID_ARGUMENT", "Missing 'fitName'", null)
                 }
             }
+            "setZoom" -> {
+                val args = call.arguments as? Map<String, Any>
+                val zoom = (args?.get("zoom") as? Double)?.toFloat() ?: 1.0f
+                setZoomNative(zoom, result)
+            }
+            "getMaxZoom" -> getMaxZoomNative(result)
+            "getMinZoom" -> getMinZoomNative(result)
             else -> result.notImplemented()
         }
     }
@@ -647,6 +654,48 @@ class CameraPlatformView(
         }
     }
 
+
+    private fun setZoomNative(zoomRatio: Float, result: MethodChannel.Result) {
+        val cam = camera
+        if (cam == null) {
+            result.error("NO_CAMERA", "Camera not initialized", null)
+            return
+        }
+        try {
+            val zoomState = cam.cameraInfo.zoomState.value
+            val minZoom = zoomState?.minZoomRatio ?: 1.0f
+            val maxZoom = zoomState?.maxZoomRatio ?: 1.0f
+            val clampedZoom = zoomRatio.coerceIn(minZoom, maxZoom)
+            cam.cameraControl.setZoomRatio(clampedZoom).addListener({
+                result.success(null)
+            }, ContextCompat.getMainExecutor(context))
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting zoom: ${e.message}", e)
+            result.error("ZOOM_FAILED", "Failed to set zoom: ${e.message}", null)
+        }
+    }
+
+    private fun getMaxZoomNative(result: MethodChannel.Result) {
+        val cam = camera
+        if (cam == null) {
+            result.success(1.0)
+            return
+        }
+        val zoomState = cam.cameraInfo.zoomState.value
+        val maxZoom = zoomState?.maxZoomRatio?.toDouble() ?: 1.0
+        result.success(maxZoom)
+    }
+
+    private fun getMinZoomNative(result: MethodChannel.Result) {
+        val cam = camera
+        if (cam == null) {
+            result.success(1.0)
+            return
+        }
+        val zoomState = cam.cameraInfo.zoomState.value
+        val minZoom = zoomState?.minZoomRatio?.toDouble() ?: 1.0
+        result.success(minZoom)
+    }
     override fun getView(): View { return previewView }
 
     override fun dispose() {
