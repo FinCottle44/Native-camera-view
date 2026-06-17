@@ -101,6 +101,18 @@ class CameraController {
     }
   }
 
+  /// Sets the target rotation for photo capture.
+  /// Use 0 for portrait, 90 for landscape-right, 180 for portrait upside-down,
+  /// 270 for landscape-left. This ensures the captured photo is oriented correctly
+  /// without needing post-capture rotation in Dart.
+  Future<void> setTargetRotation(int rotation) async {
+    try {
+      await _channel.invokeMethod('setTargetRotation', {'rotation': rotation});
+    } on PlatformException catch (e) {
+      debugPrint("CameraController: Error setting target rotation: '${e.message}'.");
+    }
+  }
+
   /// Returns the maximum zoom level supported by the current camera.
   /// Returns 1.0 if the value cannot be determined.
   Future<double> getMaxZoom() async {

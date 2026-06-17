@@ -80,6 +80,7 @@ class CameraPlatformView(
     private var currentPreviewPresetStr: String? = null
     private var currentCapturePresetStr: String? = null
     private var currentCaptureModeStr: String = "minimizeLatency"
+    private var currentTargetRotation: Int = Surface.ROTATION_0
 
     // Biến để tránh hiển thị nhiều dialog cùng lúc
     private var isDialogShowing = false
@@ -255,6 +256,11 @@ class CameraPlatformView(
                     result.error("INVALID_ARGUMENT", "Missing 'fitName'", null)
                 }
             }
+            "setTargetRotation" -> {
+                val args = call.arguments as? Map<String, Any>
+                val rotation = (args?.get("rotation") as? Int) ?: 0
+                setTargetRotationNative(rotation, result)
+            }
             "setZoom" -> {
                 val args = call.arguments as? Map<String, Any>
                 val zoom = (args?.get("zoom") as? Double)?.toFloat() ?: 1.0f
@@ -374,6 +380,7 @@ class CameraPlatformView(
             Log.d(TAG, "Setting CAPTURE resolution to $it for viewId $viewId")
         }
 
+        imageCaptureBuilder.setTargetRotation(currentTargetRotation)
         imageCapture = imageCaptureBuilder.build()
 
         val cameraSelector = CameraSelector.Builder()
@@ -654,6 +661,20 @@ class CameraPlatformView(
         }
     }
 
+
+    private fun setTargetRotationNative(rotation: Int, result: MethodChannel.Result) {
+        val surfaceRotation = when (rotation) {
+            0 -> Surface.ROTATION_0
+            90 -> Surface.ROTATION_90
+            180 -> Surface.ROTATION_180
+            270 -> Surface.ROTATION_270
+            else -> Surface.ROTATION_0
+        }
+        currentTargetRotation = surfaceRotation
+        imageCapture?.targetRotation = surfaceRotation
+        Log.d(TAG, "Set target rotation to $rotation ($surfaceRotation) for viewId $viewId")
+        result.success(null)
+    }
 
     private fun setZoomNative(zoomRatio: Float, result: MethodChannel.Result) {
         val cam = camera

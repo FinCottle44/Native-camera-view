@@ -60,6 +60,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     private var currentCameraInput: AVCaptureDeviceInput?
     private var currentCameraPosition: AVCaptureDevice.Position = .back
     private var isCameraPausedManually = false
+    private var currentPhotoOrientation: AVCaptureVideoOrientation = .portrait
     private var currentPreviewFit: String = "cover"
     private var pendingPhotoCaptureResult: FlutterResult?
 
@@ -224,7 +225,15 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 else { throw CameraSetupError.couldNotAddInput }
 
                 let newPhotoOutput = AVCapturePhotoOutput()
-                if newSession.canAddOutput(newPhotoOutput) { newSession.addOutput(newPhotoOutput); strongSelf.photoOutput = newPhotoOutput }
+                if newSession.canAddOutput(newPhotoOutput) {
+                    newSession.addOutput(newPhotoOutput)
+                    strongSelf.photoOutput = newPhotoOutput
+                    // Apply current orientation to photo output connection
+                    if let connection = newPhotoOutput.connection(with: .video),
+                       connection.isVideoOrientationSupported {
+                        connection.videoOrientation = strongSelf.currentPhotoOrientation
+                    }
+                }
                 else { throw CameraSetupError.couldNotAddPhotoOutput }
 
                 let newVideoDataOutput = AVCaptureVideoDataOutput()
@@ -317,6 +326,13 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 switchCameraNative(useFront: useFront, result: result)
             } else {
                 DispatchQueue.main.async { result(FlutterError(code: "INVALID_ARGUMENT",message: "Missing 'useFrontCamera'", details: nil)) }
+            }
+        case "setTargetRotation":
+            if let args = call.arguments as? [String: Any],
+               let rotation = args["rotation"] as? Int {
+                setTargetRotationNative(rotation: rotation, result: result)
+            } else {
+                DispatchQueue.main.async { result(FlutterError(code: "INVALID_ARGUMENT", message: "Missing rotation value", details: nil)) }
             }
         case "setZoom":
             if let args = call.arguments as? [String: Any],
@@ -688,6 +704,28 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         guard !isDeinitializing else { return }
     }
     
+
+    private func setTargetRotationNative(rotation: Int, result: @escaping FlutterResult) {
+        let orientation: AVCaptureVideoOrientation
+        switch rotation {
+        case 0: orientation = .portrait
+        case 90: orientation = .landscapeRight
+        case 180: orientation = .portraitUpsideDown
+        case 270: orientation = .landscapeLeft
+        default: orientation = .portrait
+        }
+        self.currentPhotoOrientation = orientation
+        
+        // Apply to the photo output connection immediately if available
+        sessionQueue.async { [weak self] in
+            guard let strongSelf = self else { return }
+            if let connection = strongSelf.photoOutput?.connection(with: .video),
+               connection.isVideoOrientationSupported {
+                connection.videoOrientation = orientation
+            }
+            DispatchQueue.main.async { result(nil) }
+        }
+    }
 
     private func setZoomNative(zoomFactor: CGFloat, result: @escaping FlutterResult) {
         sessionQueue.async { [weak self] in
