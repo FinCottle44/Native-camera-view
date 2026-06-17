@@ -774,11 +774,14 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         let capturedCurrentCameraInput = self.currentCameraInput
         let capturedMethodChannel = self.methodChannel
 
-        // Tất cả thao tác dọn dẹp AVFoundation nên được đưa lên sessionQueue và thực hiện đồng bộ
-        // để đảm bảo chúng hoàn tất trước khi deinit kết thúc.
-        print("[CameraPlatformView-\(currentViewId)] DEINIT: Dispatching all AVFoundation cleanup to sessionQueue (SYNC)...")
-        self.sessionQueue.sync { // SYNC block lớn cho tất cả AVFoundation cleanup
-            print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Starting AVFoundation cleanup...")
+        // All AVFoundation cleanup runs on sessionQueue. We use ASYNC (not sync) with
+        // captured locals because deinit may itself be running ON sessionQueue (when the
+        // last strong ref is released inside a sessionQueue.async block). A sync dispatch
+        // to the current queue would deadlock. The captured locals keep the AV objects
+        // alive until the async block completes.
+        print("[CameraPlatformView-\(currentViewId)] DEINIT: Dispatching all AVFoundation cleanup to sessionQueue (ASYNC)...")
+        self.sessionQueue.async { // ASYNC to avoid deadlock if deinit runs on sessionQueue
+            print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.async) Starting AVFoundation cleanup...")
 
             // 1. Dừng session
             if capturedSession?.isRunning ?? false {
