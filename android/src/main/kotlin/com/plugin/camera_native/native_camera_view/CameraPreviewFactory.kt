@@ -40,6 +40,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.graphics.PixelFormat
+import android.view.Surface
 import android.view.SurfaceView
 import android.util.Size
 
