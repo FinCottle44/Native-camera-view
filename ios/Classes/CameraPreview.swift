@@ -2,6 +2,7 @@
 import Flutter
 import UIKit
 import AVFoundation
+import Vision
 
 // Lớp UIView tùy chỉnh để quản lý frame của previewLayer
 class CameraHostView: UIView {
@@ -48,7 +49,8 @@ enum CameraSetupError: Error, LocalizedError {
 }
 
 class CameraPlatformView: NSObject, FlutterPlatformView,
-    AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate
+    AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate,
+    FlutterStreamHandler
 {
     private var _hostView: CameraHostView
     private var messenger: FlutterBinaryMessenger
@@ -73,6 +75,20 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     private let videoDataOutputQueue = DispatchQueue(label: "com.plugin.camera_native.native_camera_view.videoDataOutputQueue.view-\(UUID().uuidString)", qos: .userInitiated)
     private var lastFrameAsUIImage: UIImage?
     private lazy var ciContext = CIContext()
+
+    // --- Live subject detection (Vision saliency) ---
+    private var detectionEventChannel: FlutterEventChannel?
+    private var detectionEventSink: FlutterEventSink?
+    private var detectionEnabled: Bool = false
+    private var isProcessingDetection = false
+    private var lastDetectionTime: CFTimeInterval = 0
+    private let detectionMinInterval: CFTimeInterval = 0.1 // throttle to ~10 fps
+    // Cached device orientation (updated on the main thread) used to orient the
+    // Vision request so boxes align in every orientation, not just portrait.
+    private var currentDeviceOrientation: UIDeviceOrientation = .portrait
+    // Filtering: drop tiny salient regions and low-confidence hits.
+    private let detectionMinRelativeArea: CGFloat = 0.02
+    private let detectionMinConfidence: Float = 0.3
     
 
 
@@ -98,13 +114,35 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             if let bypass = params["bypassPermissionCheck"] as? Bool {
                 self.bypassPermissionCheck = bypass
             }
+            if let enableDetection = params["enableDetection"] as? Bool {
+                self.detectionEnabled = enableDetection
+            }
         }
         
         self.methodChannel = FlutterMethodChannel(
             name: "com.plugin.camera_native.native_camera_view/camera_method_channel_ios_\(viewId)",
             binaryMessenger: messenger
         )
+        self.detectionEventChannel = FlutterEventChannel(
+            name: "com.plugin.camera_native.native_camera_view/camera_detections_ios_\(viewId)",
+            binaryMessenger: messenger
+        )
         super.init()
+
+        self.detectionEventChannel?.setStreamHandler(self)
+
+        // Track device orientation so detection can be oriented correctly.
+        let initial = UIDevice.current.orientation
+        if initial.isPortrait || initial.isLandscape {
+            self.currentDeviceOrientation = initial
+        }
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(deviceOrientationChanged),
+            name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
 
         print("[CameraPlatformView-\(viewId)] INIT with lens: \(self.currentCameraPosition == .front ? "FRONT":"BACK"). Frame: \(frame), Thread: \(Thread.current)")
 
@@ -345,6 +383,11 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             getMaxZoomNative(result: result)
         case "getMinZoom":
             getMinZoomNative(result: result)
+        case "setDetectionEnabled":
+            let enabled = (call.arguments as? Bool) ?? false
+            self.detectionEnabled = enabled
+            print("[CameraPlatformView-\(viewId)] setDetectionEnabled: \(enabled)")
+            result(nil)
         default:
             DispatchQueue.main.async { result(FlutterMethodNotImplemented) }
         }
@@ -698,6 +741,132 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         
         // Chỉ lưu lại CGImage thô, không thực hiện bất kỳ phép biến đổi nào ở đây
         self.lastPausedFrameCGImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent)
+
+        // Run live subject detection on this frame (throttled, non-overlapping).
+        self.runSubjectDetectionIfNeeded(on: pixelBuffer)
+    }
+
+    // MARK: - Live subject detection (Vision saliency)
+
+    /// Runs Vision objectness saliency on [pixelBuffer] when detection is
+    /// enabled and a listener is attached, throttled to [detectionMinInterval]
+    /// and never overlapping. Emits normalized top-left-origin boxes.
+    @objc private func deviceOrientationChanged() {
+        let o = UIDevice.current.orientation
+        if o.isPortrait || o.isLandscape {
+            currentDeviceOrientation = o
+        }
+    }
+
+    /// Exif orientation that makes the sensor-native buffer upright for the
+    /// current device orientation. Anchored on the known-good portrait case
+    /// (.right back / .leftMirrored front); other orientations are derived from
+    /// it. NOTE: verify each orientation on-device; if one is off it's a
+    /// one-line change here.
+    private func visionOrientation() -> CGImagePropertyOrientation {
+        let isFront = currentCameraPosition == .front
+        switch currentDeviceOrientation {
+        case .portraitUpsideDown:
+            return isFront ? .rightMirrored : .left
+        case .landscapeLeft:
+            return isFront ? .downMirrored : .down
+        case .landscapeRight:
+            return isFront ? .upMirrored : .up
+        default: // .portrait and any non-interface orientation
+            return isFront ? .leftMirrored : .right
+        }
+    }
+
+    private func runSubjectDetectionIfNeeded(on pixelBuffer: CVPixelBuffer) {
+        guard detectionEnabled, detectionEventSink != nil, !isProcessingDetection else { return }
+        // Vision saliency requests require iOS 13+. Silently no-op below that.
+        guard #available(iOS 13.0, *) else { return }
+
+        let now = CACurrentMediaTime()
+        guard now - lastDetectionTime >= detectionMinInterval else { return }
+        lastDetectionTime = now
+        isProcessingDetection = true
+
+        let orientation = visionOrientation()
+        // 90°-rotated orientations swap the upright dimensions.
+        let rotates90: Bool
+        switch orientation {
+        case .left, .right, .leftMirrored, .rightMirrored: rotates90 = true
+        default: rotates90 = false
+        }
+        let bufferWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let bufferHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let uprightWidth = rotates90 ? bufferHeight : bufferWidth
+        let uprightHeight = rotates90 ? bufferWidth : bufferHeight
+
+        let request = VNGenerateObjectnessBasedSaliencyImageRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
+
+        do {
+            try handler.perform([request])
+        } catch {
+            print("[CameraPlatformView-\(viewId)] Saliency request failed: \(error.localizedDescription)")
+            isProcessingDetection = false
+            return
+        }
+
+        var detections: [[String: Any]] = []
+        if let observation = request.results?.first as? VNSaliencyImageObservation,
+           let salientObjects = observation.salientObjects {
+            // Keep only the single most prominent region: the largest box that
+            // passes the confidence + size thresholds.
+            let best = salientObjects
+                .filter {
+                    $0.confidence >= detectionMinConfidence &&
+                        ($0.boundingBox.width * $0.boundingBox.height) >= detectionMinRelativeArea
+                }
+                .max {
+                    ($0.boundingBox.width * $0.boundingBox.height) <
+                        ($1.boundingBox.width * $1.boundingBox.height)
+                }
+
+            if let object = best {
+                // Vision boundingBox is normalized, bottom-left origin. Flip Y to
+                // the top-left origin used by our wire contract.
+                let bb = object.boundingBox
+                let top = 1.0 - (bb.origin.y + bb.height)
+                let bottom = 1.0 - bb.origin.y
+                detections.append([
+                    "left": Double(bb.origin.x).clamped01(),
+                    "top": Double(top).clamped01(),
+                    "right": Double(bb.origin.x + bb.width).clamped01(),
+                    "bottom": Double(bottom).clamped01(),
+                    "confidence": Double(object.confidence)
+                ])
+            }
+        }
+
+        let payload: [String: Any] = [
+            "imageWidth": uprightWidth,
+            "imageHeight": uprightHeight,
+            "isMirrored": false,
+            "detections": detections
+        ]
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.isDeinitializing else { return }
+            self.detectionEventSink?(payload)
+        }
+        isProcessingDetection = false
+    }
+
+    // MARK: - FlutterStreamHandler (detection EventChannel)
+
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        self.detectionEventSink = events
+        print("[CameraPlatformView-\(viewId)] Detection EventChannel listener attached.")
+        return nil
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        self.detectionEventSink = nil
+        print("[CameraPlatformView-\(viewId)] Detection EventChannel listener cancelled.")
+        return nil
     }
 
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -764,6 +933,10 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     }
     deinit {
         isDeinitializing = true
+        NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
+        DispatchQueue.main.async {
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
+        }
         let currentViewId = self.viewId
         print("[CameraPlatformView-\(currentViewId)] DEINIT: Running on thread: \(Thread.current)")
         print("[CameraPlatformView-\(currentViewId)] DEINIT: Bắt đầu quá trình giải phóng.")
@@ -773,6 +946,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         let capturedVideoDataOutput = self.videoDataOutput // Tham chiếu mạnh đến output
         let capturedCurrentCameraInput = self.currentCameraInput
         let capturedMethodChannel = self.methodChannel
+        let capturedEventChannel = self.detectionEventChannel
 
         // All AVFoundation cleanup runs on sessionQueue. We use ASYNC (not sync) with
         // captured locals because deinit may itself be running ON sessionQueue (when the
@@ -820,7 +994,8 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         // Hủy method channel handler không đồng bộ trên main thread
         DispatchQueue.main.async {
             capturedMethodChannel?.setMethodCallHandler(nil)
-            print("[CameraPlatformView-\(currentViewId)] DEINIT: MethodChannel handler đã gỡ (async).")
+            capturedEventChannel?.setStreamHandler(nil)
+            print("[CameraPlatformView-\(currentViewId)] DEINIT: Method/Event channel handlers đã gỡ (async).")
         }
 
         // Gán nil cho các property để giải phóng tham chiếu mạnh
@@ -830,9 +1005,18 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         self.videoDataOutput = nil // Property này sẽ được ARC giải phóng sau khi capturedVideoDataOutput ra khỏi scope
         self.currentCameraInput = nil
         self.methodChannel = nil
+        self.detectionEventChannel = nil
+        self.detectionEventSink = nil
         self.pendingPhotoCaptureResult = nil
         self.lastFrameAsUIImage = nil
 
         print("[CameraPlatformView-\(currentViewId)] DEINIT: Hoàn tất quá trình giải phóng (synchronous part).")
+    }
+}
+
+private extension Double {
+    /// Clamps the value into the normalized 0.0...1.0 range.
+    func clamped01() -> Double {
+        return Swift.max(0.0, Swift.min(1.0, self))
     }
 }

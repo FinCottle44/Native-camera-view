@@ -1,6 +1,10 @@
 // File: lib/camera_controller.dart
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart' show debugPrint, ValueNotifier;
+
+import 'detection/subject_detection.dart';
 
 // Enum to define fit modes for camera preview
 enum CameraPreviewFit {
@@ -12,6 +16,8 @@ enum CameraPreviewFit {
 
 class CameraController {
   final MethodChannel _channel;
+  final EventChannel? _detectionChannel;
+  StreamSubscription<dynamic>? _detectionSubscription;
 
   bool _isFrontCamera = false;
   bool get isFrontCamera => _isFrontCamera;
@@ -20,8 +26,126 @@ class CameraController {
   final ValueNotifier<bool> isLoading = ValueNotifier(true);
   final ValueNotifier<String?> errorMessage = ValueNotifier(null);
 
-  CameraController({required MethodChannel channel}) : _channel = channel {
+  /// Latest live subject-detection result. Emits [DetectionFrame.empty] until
+  /// the first frame arrives (or when detection is disabled). Only produces
+  /// data when the view was created with `enableDetection: true`.
+  ///
+  /// When [detectionSmoothing] > 0 the primary box is smoothed across frames to
+  /// remove jitter.
+  final ValueNotifier<DetectionFrame> detections =
+      ValueNotifier(DetectionFrame.empty);
+
+  /// Exponential smoothing factor for the primary box, 0.0..1.0. Higher is
+  /// snappier (0.0 disables smoothing, 1.0 = no smoothing). ~0.4 is a good
+  /// balance between responsiveness and stability.
+  final double detectionSmoothing;
+
+  // Smoothing state.
+  Rect? _smoothedRect;
+  SubjectDetection? _lastPrimary;
+  int _missFrames = 0;
+  static const int _maxMissFrames = 5;
+
+  CameraController({
+    required MethodChannel channel,
+    EventChannel? detectionChannel,
+    this.detectionSmoothing = 0.4,
+  })  : _channel = channel,
+        _detectionChannel = detectionChannel {
     _channel.setMethodCallHandler(_handleNativeMethodCall);
+    _subscribeToDetections();
+  }
+
+  void _subscribeToDetections() {
+    final channel = _detectionChannel;
+    if (channel == null) return;
+    _detectionSubscription = channel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is! Map) return;
+        final frame = DetectionFrame.fromMap(event);
+        detections.value =
+            detectionSmoothing <= 0 ? frame : _smoothFrame(frame);
+      },
+      onError: (Object error) {
+        debugPrint("CameraController: detection stream error: $error");
+      },
+    );
+  }
+
+  /// Applies EMA smoothing to the primary (first) box and holds the last box
+  /// through a short run of empty frames to avoid flicker.
+  DetectionFrame _smoothFrame(DetectionFrame frame) {
+    final primary = frame.detections.isNotEmpty ? frame.detections.first : null;
+
+    if (primary == null) {
+      _missFrames++;
+      if (_missFrames > _maxMissFrames || _smoothedRect == null) {
+        _smoothedRect = null;
+        _lastPrimary = null;
+        return DetectionFrame(
+          imageWidth: frame.imageWidth,
+          imageHeight: frame.imageHeight,
+          isMirrored: frame.isMirrored,
+          detections: const <SubjectDetection>[],
+        );
+      }
+      // Hold the last smoothed box briefly.
+      return _frameWith(frame, _smoothedRect!, _lastPrimary!);
+    }
+
+    _missFrames = 0;
+    final target = primary.normalizedRect;
+    final prev = _smoothedRect;
+    final t = detectionSmoothing.clamp(0.0, 1.0);
+    final smoothed = prev == null
+        ? target
+        : Rect.fromLTRB(
+            _lerp(prev.left, target.left, t),
+            _lerp(prev.top, target.top, t),
+            _lerp(prev.right, target.right, t),
+            _lerp(prev.bottom, target.bottom, t),
+          );
+    _smoothedRect = smoothed;
+    _lastPrimary = primary;
+    return _frameWith(frame, smoothed, primary);
+  }
+
+  DetectionFrame _frameWith(
+      DetectionFrame frame, Rect rect, SubjectDetection source) {
+    return DetectionFrame(
+      imageWidth: frame.imageWidth,
+      imageHeight: frame.imageHeight,
+      isMirrored: frame.isMirrored,
+      detections: <SubjectDetection>[
+        SubjectDetection(
+          left: rect.left,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+          confidence: source.confidence,
+          label: source.label,
+          trackingId: source.trackingId,
+        ),
+      ],
+    );
+  }
+
+  static double _lerp(double a, double b, double t) => a + (b - a) * t;
+
+  /// Turns live subject detection on or off at runtime. The view must have been
+  /// created with `enableDetection: true` for the native analyzer to be wired.
+  Future<void> setDetectionEnabled(bool enabled) async {
+    try {
+      await _channel.invokeMethod('setDetectionEnabled', enabled);
+      if (!enabled) {
+        _smoothedRect = null;
+        _lastPrimary = null;
+        _missFrames = 0;
+        detections.value = DetectionFrame.empty;
+      }
+    } on PlatformException catch (e) {
+      debugPrint("CameraController: Error setting detection enabled: '${e.message}'.");
+    }
   }
 
   Future<void> _handleNativeMethodCall(MethodCall call) async {
@@ -155,8 +279,12 @@ class CameraController {
   }
 
   void dispose() {
+    _detectionSubscription?.cancel();
+    _detectionSubscription = null;
     isPaused.dispose();
     isLoading.dispose();
+    errorMessage.dispose();
+    detections.dispose();
     _channel.setMethodCallHandler(null);
   }
 }

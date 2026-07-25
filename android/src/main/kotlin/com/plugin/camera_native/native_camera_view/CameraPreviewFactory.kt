@@ -11,6 +11,7 @@ import android.net.Uri
 import android.provider.Settings
 import android.util.Log
 import android.view.MotionEvent
+import android.view.OrientationEventListener
 import android.view.View
 import androidx.annotation.NonNull
 import androidx.core.app.ActivityCompat
@@ -23,6 +24,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import com.google.common.util.concurrent.ListenableFuture
 import io.flutter.plugin.common.BinaryMessenger
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.StandardMessageCodec
@@ -70,6 +72,14 @@ class CameraPlatformView(
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
     private var previewUseCase: Preview? = null
+    private var imageAnalysisUseCase: ImageAnalysis? = null
+    private var detectionAnalyzer: SubjectDetectionAnalyzer? = null
+    private lateinit var analysisExecutor: ExecutorService
+    private var detectionEnabled: Boolean = false
+    private lateinit var eventChannel: EventChannel
+    private var detectionEventSink: EventChannel.EventSink? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var orientationEventListener: OrientationEventListener? = null
     private lateinit var methodChannel: MethodChannel
     private var isCameraPausedManually = false
     private var currentLensFacing: Int = CameraSelector.LENS_FACING_BACK
@@ -127,15 +137,32 @@ class CameraPlatformView(
 
         applyPreviewFit() // Truyền creationParams
 
+        detectionEnabled = creationParams?.get("enableDetection") as? Boolean ?: false
+
         //COMPATIBLE PERFORMANCE
         previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         cameraExecutor = Executors.newSingleThreadExecutor()
+        analysisExecutor = Executors.newSingleThreadExecutor()
 
         val channelName = "com.plugin.camera_native.native_camera_view/camera_method_channel_$viewId"
         methodChannel = MethodChannel(binaryMessenger, channelName)
         methodChannel.setMethodCallHandler { call, result ->
             handleMethodCall(call, result)
         }
+
+        val eventChannelName = "com.plugin.camera_native.native_camera_view/camera_detections_$viewId"
+        eventChannel = EventChannel(binaryMessenger, eventChannelName)
+        eventChannel.setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                detectionEventSink = events
+                Log.d(TAG, "Detection EventChannel listener attached for viewId $viewId.")
+            }
+
+            override fun onCancel(arguments: Any?) {
+                detectionEventSink = null
+                Log.d(TAG, "Detection EventChannel listener cancelled for viewId $viewId.")
+            }
+        })
 
         setupTapToFocus()
     }
@@ -269,6 +296,10 @@ class CameraPlatformView(
             }
             "getMaxZoom" -> getMaxZoomNative(result)
             "getMinZoom" -> getMinZoomNative(result)
+            "setDetectionEnabled" -> {
+                val enabled = call.arguments as? Boolean ?: false
+                setDetectionEnabledNative(enabled, result)
+            }
             else -> result.notImplemented()
         }
     }
@@ -384,6 +415,34 @@ class CameraPlatformView(
         imageCaptureBuilder.setTargetRotation(currentTargetRotation)
         imageCapture = imageCaptureBuilder.build()
 
+        // Live subject-detection use case (opt-in, skipped while paused).
+        imageAnalysisUseCase = null
+        detectionAnalyzer?.close()
+        detectionAnalyzer = null
+        if (detectionEnabled && !isCameraPausedManually) {
+            val analyzer = SubjectDetectionAnalyzer { imageWidth, imageHeight, detections ->
+                val isFront = currentLensFacing == CameraSelector.LENS_FACING_FRONT
+                val payload = mapOf(
+                    "imageWidth" to imageWidth,
+                    "imageHeight" to imageHeight,
+                    // Analysis frames are NOT mirrored, but the preview mirrors the
+                    // front camera, so the Dart side must flip X to match.
+                    "isMirrored" to isFront,
+                    "detections" to detections
+                )
+                mainHandler.post { detectionEventSink?.success(payload) }
+            }
+            detectionAnalyzer = analyzer
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+            analysis.setAnalyzer(analysisExecutor, analyzer)
+            imageAnalysisUseCase = analysis
+            Log.d(TAG, "Subject detection ImageAnalysis enabled for viewId $viewId")
+        }
+
+        if (detectionEnabled) startOrientationTracking() else stopOrientationTracking()
+
         val cameraSelector = CameraSelector.Builder()
             .requireLensFacing(currentLensFacing)
             .build()
@@ -394,6 +453,7 @@ class CameraPlatformView(
                 previewUseCase?.let { useCasesToBind.add(it) }
             }
             imageCapture?.let { useCasesToBind.add(it) }
+            imageAnalysisUseCase?.let { useCasesToBind.add(it) }
 
             if(useCasesToBind.isEmpty() && imageCapture == null){
                 Log.w(TAG, "No use cases to bind for viewId $viewId. ImageCapture is null.")
@@ -453,6 +513,50 @@ class CameraPlatformView(
             bindCameraUseCases(cameraProvider!!)
         } else {
             Log.w(TAG, "CameraProvider not available yet for viewId $viewId on resume.")
+        }
+        result.success(null)
+    }
+
+    // Keeps the analysis (and capture) target rotation aligned with the device
+    // orientation so ML Kit boxes stay upright in the display's orientation.
+    // Without this, boxes are correct in portrait but drift in landscape.
+    private fun startOrientationTracking() {
+        if (orientationEventListener != null) return
+        val listener = object : OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                val rotation = when (orientation) {
+                    in 45 until 135 -> Surface.ROTATION_270
+                    in 135 until 225 -> Surface.ROTATION_180
+                    in 225 until 315 -> Surface.ROTATION_90
+                    else -> Surface.ROTATION_0
+                }
+                imageAnalysisUseCase?.targetRotation = rotation
+                imageCapture?.targetRotation = rotation
+            }
+        }
+        if (listener.canDetectOrientation()) {
+            listener.enable()
+            orientationEventListener = listener
+            Log.d(TAG, "Orientation tracking enabled for viewId $viewId")
+        }
+    }
+
+    private fun stopOrientationTracking() {
+        orientationEventListener?.disable()
+        orientationEventListener = null
+    }
+
+    private fun setDetectionEnabledNative(enabled: Boolean, result: MethodChannel.Result) {
+        Log.d(TAG, "setDetectionEnabled($enabled) for viewId $viewId")
+        if (detectionEnabled == enabled) {
+            result.success(null)
+            return
+        }
+        detectionEnabled = enabled
+        // Rebind so the ImageAnalysis use case is added/removed.
+        if (cameraProvider != null && !isCameraPausedManually) {
+            bindCameraUseCases(cameraProvider!!)
         }
         result.success(null)
     }
@@ -725,9 +829,17 @@ class CameraPlatformView(
         lifecycleOwner.lifecycle.removeObserver(this)
         isCameraPausedManually = false
         isCameraInitialized = false
+        stopOrientationTracking()
+        imageAnalysisUseCase?.clearAnalyzer()
+        imageAnalysisUseCase = null
+        detectionAnalyzer?.close()
+        detectionAnalyzer = null
         cameraExecutor.shutdown()
+        analysisExecutor.shutdown()
         cameraProvider?.unbindAll()
         camera = null
+        detectionEventSink = null
+        eventChannel.setStreamHandler(null)
         methodChannel.setMethodCallHandler(null)
     }
 }

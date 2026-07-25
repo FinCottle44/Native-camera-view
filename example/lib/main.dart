@@ -232,6 +232,10 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
               onControllerCreated: _onCameraControllerCreated,
               cameraPreviewFit: CameraPreviewFit.cover,
               isFrontCamera: _isFrontCameraSelected,
+              // Live subject/foreground bounding box (new feature under test).
+              enableDetection: true,
+              showDetectionBox: true,
+              detectionBoxColor: Colors.cyanAccent,
             ),
           ),
           if (_cameraController != null)
