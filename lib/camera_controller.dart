@@ -35,6 +35,20 @@ class CameraController {
   final ValueNotifier<DetectionFrame> detections =
       ValueNotifier(DetectionFrame.empty);
 
+  /// Whether a car is currently detected in the frame. Advisory only.
+  final ValueNotifier<bool> isCarDetected = ValueNotifier(false);
+
+  /// Whether the detected car touches a frame edge (i.e. it's likely cropped /
+  /// cut off in the shot). Always false when no car is detected. Drive a
+  /// "move back / center the car" warning from this. Advisory only — it never
+  /// blocks capture.
+  final ValueNotifier<bool> isCarCropped = ValueNotifier(false);
+
+  /// Whether there's enough ground/foreground beneath the detected car (per the
+  /// view's `groundGuideMinFraction`). True when no car is detected, so drive a
+  /// hint from `isCarDetected && !hasEnoughGround`. Advisory only.
+  final ValueNotifier<bool> hasEnoughGround = ValueNotifier(true);
+
   /// Exponential smoothing factor for the primary box, 0.0..1.0. Higher is
   /// snappier (0.0 disables smoothing, 1.0 = no smoothing). ~0.4 is a good
   /// balance between responsiveness and stability.
@@ -65,6 +79,11 @@ class CameraController {
         final frame = DetectionFrame.fromMap(event);
         detections.value =
             detectionSmoothing <= 0 ? frame : _smoothFrame(frame);
+        // Framing state, computed natively against the visible preview.
+        isCarDetected.value =
+            event['isDetected'] as bool? ?? frame.detections.isNotEmpty;
+        isCarCropped.value = event['isCropped'] as bool? ?? false;
+        hasEnoughGround.value = event['hasEnoughGround'] as bool? ?? true;
       },
       onError: (Object error) {
         debugPrint("CameraController: detection stream error: $error");
@@ -142,6 +161,9 @@ class CameraController {
         _lastPrimary = null;
         _missFrames = 0;
         detections.value = DetectionFrame.empty;
+        isCarDetected.value = false;
+        isCarCropped.value = false;
+        hasEnoughGround.value = true;
       }
     } on PlatformException catch (e) {
       debugPrint("CameraController: Error setting detection enabled: '${e.message}'.");
@@ -285,6 +307,9 @@ class CameraController {
     isLoading.dispose();
     errorMessage.dispose();
     detections.dispose();
+    isCarDetected.dispose();
+    isCarCropped.dispose();
+    hasEnoughGround.dispose();
     _channel.setMethodCallHandler(null);
   }
 }

@@ -7,10 +7,10 @@ import '../camera_controller.dart';
 import '../detection/subject_detection.dart';
 import '../detection/bounding_box_painter.dart';
 
-//đặt độ phân giải
+//sets the resolution
 enum CameraResolutionPreset { low, medium, high, max }
 
-//chế độ chụp ảnh
+//photo capture mode
 enum CameraCaptureMode { minimizeLatency, maximizeQuality }
 
 class NativeCameraView extends StatefulWidget {
@@ -33,8 +33,15 @@ class NativeCameraView extends StatefulWidget {
   /// `controller.detections` yourself and draw a custom overlay.
   final bool showDetectionBox;
 
-  /// Stroke color of the built-in bounding box.
+  /// Stroke color of the box when the car is fully in frame.
   final Color detectionBoxColor;
+
+  /// Stroke color of the box when the car touches a frame edge (likely cropped).
+  final Color croppedBoxColor;
+
+  /// Fraction of the smaller preview dimension used as the edge margin for the
+  /// cropped check. Defaults to 0.02 (2%).
+  final double croppedEdgeMargin;
 
   /// Stroke width of the built-in bounding box.
   final double detectionBoxStrokeWidth;
@@ -42,6 +49,22 @@ class NativeCameraView extends StatefulWidget {
   /// Temporal smoothing for the detection box, 0.0..1.0. Higher is snappier;
   /// 0.0 disables smoothing. Defaults to 0.4.
   final double detectionSmoothing;
+
+  /// When true and [enableDetection] is on, shows a translucent "ground guide"
+  /// band below the detected car — a cue to leave enough ground/foreground
+  /// beneath the car. Purple (~30% opacity) when there's enough ground, red when
+  /// not. Defaults to false.
+  final bool showGroundGuide;
+
+  /// Minimum ground beyond the car, as a fraction of the relevant preview
+  /// dimension, for the ground to count as sufficient (guide drawn purple rather
+  /// than red, and `controller.hasEnoughGround` true). Defaults to 0.15 (15%).
+  final double groundGuideMinFraction;
+
+  /// Which edge the ground guide extends from. For a portrait-locked app used in
+  /// landscape-left, set this to [GroundGuideEdge.left]. Defaults to
+  /// [GroundGuideEdge.bottom].
+  final GroundGuideEdge groundGuideEdge;
 
   const NativeCameraView({
     super.key,
@@ -55,9 +78,14 @@ class NativeCameraView extends StatefulWidget {
     this.captureMode,
     this.enableDetection = false,
     this.showDetectionBox = true,
-    this.detectionBoxColor = const Color(0xFF00E5FF),
+    this.detectionBoxColor = const Color(0xFF6E23FE),
+    this.croppedBoxColor = const Color(0xFFFF3B30),
+    this.croppedEdgeMargin = 0.02,
     this.detectionBoxStrokeWidth = 3.0,
     this.detectionSmoothing = 0.4,
+    this.showGroundGuide = false,
+    this.groundGuideMinFraction = 0.15,
+    this.groundGuideEdge = GroundGuideEdge.bottom,
   });
 
   @override
@@ -87,7 +115,7 @@ class _NativeCameraViewState extends State<NativeCameraView> {
       detectionChannel = EventChannel(detectionChannelName);
     }
 
-    // Dùng setState để gán controller và build lại widget
+    // Use setState to assign the controller and rebuild the widget
     setState(() {
       _controller = CameraController(
         channel: platformChannel,
@@ -102,15 +130,20 @@ class _NativeCameraViewState extends State<NativeCameraView> {
 
   @override
   Widget build(BuildContext context) {
-    // ✨ Thêm lại Stack và ValueListenableBuilder để quản lý UI loading ✨
+    // ✨ Re-add Stack and ValueListenableBuilder to manage the loading UI ✨
     return Stack(
       alignment: Alignment.center,
       children: [
-        // Lớp 1: Camera View luôn được build ở dưới cùng
+        // Layer 1: Camera View is always built at the bottom
         _buildPlatformCameraView(),
 
-        // Lớp 1.5: Detection bounding-box overlay
-        if (_controller != null && widget.enableDetection && widget.showDetectionBox)
+        // Layer 1.5: Detection overlay (box + ground guide) — Android only.
+        // iOS draws these natively on the preview, so the Dart painter is never
+        // used there (its coordinate mapping wouldn't match the iOS preview).
+        if (Platform.isAndroid &&
+            _controller != null &&
+            widget.enableDetection &&
+            (widget.showDetectionBox || widget.showGroundGuide))
           Positioned.fill(
             child: ValueListenableBuilder<DetectionFrame>(
               valueListenable: _controller!.detections,
@@ -120,15 +153,22 @@ class _NativeCameraViewState extends State<NativeCameraView> {
                     frame: frame,
                     fit: widget.cameraPreviewFit ?? CameraPreviewFit.cover,
                     color: widget.detectionBoxColor,
+                    croppedColor: widget.croppedBoxColor,
+                    edgeMargin: widget.croppedEdgeMargin,
                     strokeWidth: widget.detectionBoxStrokeWidth,
+                    showLabel: false,
+                    showBox: widget.showDetectionBox,
+                    showGroundGuide: widget.showGroundGuide,
+                    groundMinFraction: widget.groundGuideMinFraction,
+                    groundEdge: widget.groundGuideEdge,
                   ),
                 );
               },
             ),
           ),
 
-        // Lớp 2: Lớp loading nằm đè lên trên
-        // Chỉ build lớp này khi controller đã được tạo
+        // Layer 2: The loading layer sits on top
+        // Only build this layer once the controller has been created
         if (_controller != null)
           ValueListenableBuilder<bool>(
             valueListenable: _controller!.isLoading,
@@ -158,6 +198,10 @@ class _NativeCameraViewState extends State<NativeCameraView> {
       'capturePreset': widget.capturePreset?.name,
       'captureMode': widget.captureMode?.name,
       'enableDetection': widget.enableDetection,
+      'showDetectionBox': widget.showDetectionBox,
+      'showGroundGuide': widget.showGroundGuide,
+      'groundGuideMinFraction': widget.groundGuideMinFraction,
+      'groundGuideEdge': widget.groundGuideEdge.name,
     };
 
     final key = ValueKey("native_camera_platform_view_${creationParams['isFrontCamera']}");
@@ -180,6 +224,6 @@ class _NativeCameraViewState extends State<NativeCameraView> {
       );
     }
 
-    return const Center(child: Text("Nền tảng không được hỗ trợ."));
+    return const Center(child: Text("Platform not supported."));
   }
 }

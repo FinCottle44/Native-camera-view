@@ -44,7 +44,8 @@ android {
     }
 
     defaultConfig {
-        minSdk = 21
+        // MediaPipe Tasks Vision requires API 24+.
+        minSdk = 24
     }
 
     dependencies {
@@ -77,7 +78,7 @@ dependencies {
     implementation "androidx.camera:camera-extensions:${camerax_version}"
     implementation 'androidx.appcompat:appcompat:1.6.1'
 
-    // ML Kit on-device object detection & tracking (bundled model, no download).
-    // Used for the live subject/foreground bounding-box feature.
-    implementation 'com.google.mlkit:object-detection:17.0.2'
+    // MediaPipe Tasks Vision: on-device object detection running the bundled
+    // EfficientDet-Lite0 model (Apache-2.0) for live car detection.
+    implementation 'com.google.mediapipe:tasks-vision:0.10.14'
 }

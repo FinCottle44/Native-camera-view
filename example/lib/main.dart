@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
 import 'dart:io';
-// Giả sử package của bạn ở đây
+// Assume your package is here
 import 'package:native_camera_view/native_camera_view.dart';
 
 void main() {
-  // Đảm bảo rằng các binding của Flutter đã được khởi tạo
+  // Ensure that Flutter bindings are initialized
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
 }
@@ -38,9 +38,9 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-// NEW: Thêm 'WidgetsBindingObserver' để lắng nghe vòng đời ứng dụng
+// NEW: Add 'WidgetsBindingObserver' to listen to the app lifecycle
 class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
-  // REMOVED: _cameraKey không còn cần thiết
+  // REMOVED: _cameraKey is no longer needed
   // var _cameraKey = UniqueKey();
 
   CameraController? _cameraController;
@@ -51,29 +51,29 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    // NEW: Đăng ký lắng nghe vòng đời ứng dụng
+    // NEW: Register to listen to the app lifecycle
     WidgetsBinding.instance.addObserver(this);
   }
 
-  // NEW: Xử lý các thay đổi vòng đời ứng dụng
+  // NEW: Handle app lifecycle changes
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
 
-    // Nếu controller chưa sẵn sàng, bỏ qua
+    // If the controller is not ready yet, skip
     if (_cameraController == null || !mounted) {
       return;
     }
 
     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
-      // Tạm dừng camera khi ứng dụng không active
+      // Pause the camera when the app is not active
       if (!isPaused.value) {
         _cameraController?.pauseCamera();
         isPaused.value = true;
         print("AppLifecycle: Camera paused.");
       }
     } else if (state == AppLifecycleState.resumed) {
-      // Tiếp tục camera khi ứng dụng quay trở lại
+      // Resume the camera when the app comes back
       if (isPaused.value) {
         _cameraController?.resumeCamera();
         isPaused.value = false;
@@ -84,7 +84,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
-    // NEW: Hủy đăng ký lắng nghe
+    // NEW: Unregister the listener
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -109,16 +109,16 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     }
   }
 
-  // MODIFIED: Cập nhật logic chụp ảnh để pause/resume
+  // MODIFIED: Updated capture logic to pause/resume
   Future<void> _captureImage() async {
     if (_cameraController == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Controller chưa sẵn sàng.')),
+        const SnackBar(content: Text('Controller is not ready.')),
       );
       return;
     }
 
-    // Tạm dừng camera trước khi chụp và điều hướng
+    // Pause the camera before capturing and navigating
     if (!isPaused.value) {
       await _cameraController?.pauseCamera();
       isPaused.value = true;
@@ -129,7 +129,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     if (path != null && mounted) {
       print("Image captured at: $path");
 
-      // Điều hướng sang màn hình xem ảnh
+      // Navigate to the image viewer screen
       await Navigator.push(
         context,
         MaterialPageRoute(
@@ -137,21 +137,21 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
         ),
       );
 
-      // REMOVED: Không cần tạo lại camera nữa
+      // REMOVED: No need to recreate the camera anymore
       // setState(() {
       //   _cameraKey = UniqueKey();
       // });
 
-      // MODIFIED: Tiếp tục camera khi người dùng quay lại
+      // MODIFIED: Resume the camera when the user comes back
       if (mounted && isPaused.value) {
         await _cameraController?.resumeCamera();
         isPaused.value = false;
       }
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Chụp ảnh thất bại.')),
+        const SnackBar(content: Text('Image capture failed.')),
       );
-      // Nếu chụp thất bại, resume lại camera
+      // If capture failed, resume the camera
       if (isPaused.value) {
         await _cameraController?.resumeCamera();
         isPaused.value = false;
@@ -162,7 +162,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   Future<void> _switchCamera() async {
     if (_cameraController == null || isPaused.value) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(isPaused.value ? 'Resume camera trước.' : 'Controller chưa sẵn sàng.')),
+        SnackBar(content: Text(isPaused.value ? 'Resume the camera first.' : 'Controller is not ready.')),
       );
       return;
     }
@@ -189,7 +189,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
     bool? success = await _cameraController?.deleteAllCapturedPhotos();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(success == true ? 'Đã xóa tất cả ảnh.' : 'Xóa ảnh thất bại hoặc không có ảnh.')),
+        SnackBar(content: Text(success == true ? 'All photos deleted.' : 'Failed to delete photos or there were none.')),
       );
     }
   }
@@ -232,10 +232,15 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
               onControllerCreated: _onCameraControllerCreated,
               cameraPreviewFit: CameraPreviewFit.cover,
               isFrontCamera: _isFrontCameraSelected,
-              // Live subject/foreground bounding box (new feature under test).
+              // iOS draws the box natively on the preview (see
+              // CameraPreview.swift), so the Dart overlay is only used on
+              // Android.
               enableDetection: true,
+              // Box shows on both platforms (iOS native, Android Dart overlay).
               showDetectionBox: true,
-              detectionBoxColor: Colors.cyanAccent,
+              showGroundGuide: true,
+              // App is held in landscape-left, so the ground is toward the left.
+              groundGuideEdge: GroundGuideEdge.left,
             ),
           ),
           if (_cameraController != null)
@@ -251,6 +256,44 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
                     foregroundColor: Colors.white,
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                     textStyle: const TextStyle(fontSize: 12)),
+              ),
+            ),
+          // Framing warnings driven by the controller's detection state.
+          if (_cameraController != null)
+            Positioned(
+              top: 60,
+              left: 16,
+              right: 16,
+              child: AnimatedBuilder(
+                animation: Listenable.merge([
+                  _cameraController!.isCarDetected,
+                  _cameraController!.isCarCropped,
+                  _cameraController!.hasEnoughGround,
+                ]),
+                builder: (context, _) {
+                  final detected = _cameraController!.isCarDetected.value;
+                  final cropped = _cameraController!.isCarCropped.value;
+                  final enoughGround = _cameraController!.hasEnoughGround.value;
+                  String? message;
+                  if (detected && cropped) {
+                    message = 'Car is cut off — move back to fit the whole car';
+                  } else if (detected && !enoughGround) {
+                    message = 'Leave more ground below the car';
+                  }
+                  if (message == null) return const SizedBox.shrink();
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withValues(alpha: 0.85),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      message,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                    ),
+                  );
+                },
               ),
             ),
           if (_cameraController != null)

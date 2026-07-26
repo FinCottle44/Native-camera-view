@@ -38,6 +38,8 @@ The plugin uses `AndroidView` (Android) and `UiKitView` (iOS) to embed the nativ
 
 ### iOS
 
+* **Minimum iOS version:** 13.0
+
 Add the following keys to your `ios/Runner/Info.plist` file:
 
 ```xml
@@ -49,9 +51,24 @@ Add the following keys to your `ios/Runner/Info.plist` file:
 <string>This app needs permission to add photos to your library.</string>
 ```
 
+> ⚠️ **Required Podfile change.** This plugin uses MediaPipe for on-device car
+> detection, which ships as a **static** framework. Your app's `ios/Podfile`
+> must use static linkage or the build fails with
+> `Unable to find module dependency: 'MediaPipeTasksVision'`:
+>
+> ```ruby
+> target 'Runner' do
+>   use_frameworks! :linkage => :static   # <-- required (not just `use_frameworks!`)
+>
+>   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+> end
+> ```
+>
+> After changing it, run `pod install` again in `ios/` (or `cd ios && pod install`).
+
 ### Android
 
-* **Minimum API Level:** 21 (Android 5.0 - due to CameraX usage)
+* **Minimum API Level:** 24 (Android 7.0 — required by MediaPipe Tasks; also uses CameraX)
 
 Add the following permission to your `android/app/src/main/AndroidManifest.xml`:
 

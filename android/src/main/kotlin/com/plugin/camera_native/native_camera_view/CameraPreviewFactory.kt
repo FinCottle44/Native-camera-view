@@ -1,5 +1,5 @@
 // File: android/app/src/main/kotlin/com/plugin/camera_native/native_camera_view/CameraPreviewFactory.kt
-package com.plugin.camera_native.native_camera_view // Cập nhật package name
+package com.plugin.camera_native.native_camera_view // Updated package name
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -11,7 +11,6 @@ import android.net.Uri
 import android.provider.Settings
 import android.util.Log
 import android.view.MotionEvent
-import android.view.OrientationEventListener
 import android.view.View
 import androidx.annotation.NonNull
 import androidx.core.app.ActivityCompat
@@ -76,10 +75,11 @@ class CameraPlatformView(
     private var detectionAnalyzer: SubjectDetectionAnalyzer? = null
     private lateinit var analysisExecutor: ExecutorService
     private var detectionEnabled: Boolean = false
+    private var groundGuideMinFraction: Float = 0.15f
+    private var groundGuideEdge: String = "bottom" // bottom | top | left | right
     private lateinit var eventChannel: EventChannel
     private var detectionEventSink: EventChannel.EventSink? = null
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var orientationEventListener: OrientationEventListener? = null
     private lateinit var methodChannel: MethodChannel
     private var isCameraPausedManually = false
     private var currentLensFacing: Int = CameraSelector.LENS_FACING_BACK
@@ -93,7 +93,7 @@ class CameraPlatformView(
     private var currentCaptureModeStr: String = "minimizeLatency"
     private var currentTargetRotation: Int = Surface.ROTATION_0
 
-    // Biến để tránh hiển thị nhiều dialog cùng lúc
+    // Flag to avoid showing multiple dialogs at the same time
     private var isDialogShowing = false
     private var hasRequestedPermission = false
     private var bypassPermissionCheck: Boolean = false
@@ -117,7 +117,7 @@ class CameraPlatformView(
             }
         }
 
-        lifecycleOwner.lifecycle.addObserver(this) // Đăng ký observer
+        lifecycleOwner.lifecycle.addObserver(this) // Register the observer
 
         val useFrontInitially = creationParams?.get("isFrontCamera") as? Boolean ?: false
         currentLensFacing = if (useFrontInitially) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
@@ -127,7 +127,7 @@ class CameraPlatformView(
 
         currentPreviewPresetStr = creationParams?.get("previewPreset") as? String
         currentCapturePresetStr = creationParams?.get("capturePreset") as? String
-        currentCaptureModeStr = (creationParams?.get("captureMode") as? String) ?: "minimizeLatency" // Mặc định là minimizeLatency
+        currentCaptureModeStr = (creationParams?.get("captureMode") as? String) ?: "minimizeLatency" // Defaults to minimizeLatency
 
         Log.d(TAG, "Initial lens facing for viewId $viewId: ${if (currentLensFacing == CameraSelector.LENS_FACING_FRONT) "FRONT" else "BACK"}")
         Log.d(TAG, "Initial settings for viewId $viewId: " +
@@ -135,9 +135,11 @@ class CameraPlatformView(
                 "capturePreset=$currentCapturePresetStr, " +
                 "captureMode=$currentCaptureModeStr")
 
-        applyPreviewFit() // Truyền creationParams
+        applyPreviewFit() // Pass creationParams
 
         detectionEnabled = creationParams?.get("enableDetection") as? Boolean ?: false
+        groundGuideMinFraction = (creationParams?.get("groundGuideMinFraction") as? Double)?.toFloat() ?: 0.15f
+        groundGuideEdge = (creationParams?.get("groundGuideEdge") as? String) ?: "bottom"
 
         //COMPATIBLE PERFORMANCE
         previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -169,10 +171,10 @@ class CameraPlatformView(
 
     override fun onResume(owner: LifecycleOwner) {
         super.onResume(owner)
-        // Nếu dialog của mình đang hiện thì không làm gì cả
+        // If our dialog is currently showing, do nothing
         if (isDialogShowing) return
 
-        // Kiểm tra quyền
+        // Check permissions
         checkPermissionsAndSetup()
     }
 
@@ -187,7 +189,7 @@ class CameraPlatformView(
         return null
     }
 
-    // Logic kiểm tra quyền được cập nhật hoàn toàn
+    // Fully updated permission-checking logic
     private fun checkPermissionsAndSetup() {
         if (bypassPermissionCheck) {
             setupCamera()
@@ -225,7 +227,7 @@ class CameraPlatformView(
         }
 
         hasRequestedPermission = true
-        lastPermissionRequestTime = System.currentTimeMillis() // Cập nhật thời gian chặn
+        lastPermissionRequestTime = System.currentTimeMillis() // Update the throttle timestamp
 
         Log.d(TAG, "Requesting camera permission...")
         ActivityCompat.requestPermissions(
@@ -235,7 +237,7 @@ class CameraPlatformView(
         )
     }
 
-    // Hàm mới để hiển thị dialog khi không có quyền
+    // New function to show a dialog when permission is missing
     private fun showPermissionDeniedDialog() {
         if (isDialogShowing) return
         isDialogShowing = true
@@ -274,11 +276,11 @@ class CameraPlatformView(
                 switchCameraNative(useFront, result)
             }
             "deleteAllCapturedPhotos" -> deleteAllPhotosNative(result)
-            "setPreviewFit" -> { // Xử lý thay đổi fit mode từ Flutter
+            "setPreviewFit" -> { // Handle fit mode changes from Flutter
                 val fitName = call.arguments as? String
                 if (fitName != null) {
                     currentPreviewFitStr = fitName.lowercase(Locale.getDefault())
-                    applyPreviewFit() // Áp dụng ngay lập tức
+                    applyPreviewFit() // Apply immediately
                     result.success(null)
                 } else {
                     result.error("INVALID_ARGUMENT", "Missing 'fitName'", null)
@@ -341,7 +343,7 @@ class CameraPlatformView(
         previewView.scaleType = when (currentPreviewFitStr) {
             "fitwidth" -> PreviewView.ScaleType.FILL_START
             "fitheight" -> PreviewView.ScaleType.FILL_END
-            "contain" -> PreviewView.ScaleType.FIT_START // Hoặc FIT_CENTER nếu muốn căn giữa
+            "contain" -> PreviewView.ScaleType.FIT_START // Or FIT_CENTER if you want it centered
             "cover" -> PreviewView.ScaleType.FILL_CENTER
             else -> {
                 Log.w(TAG, "Unknown cameraPreviewFit value: '$currentPreviewFitStr'. Defaulting to FILL_CENTER.")
@@ -371,12 +373,12 @@ class CameraPlatformView(
             "low" -> Size(640, 480)    // SD
             "medium" -> Size(1280, 720)   // HD
             "high" -> Size(1920, 1080)  // FHD
-            "max" -> null // Để CameraX chọn độ phân giải cao nhất
-            else -> null // Mặc định (không cài đặt)
+            "max" -> null // Let CameraX choose the highest resolution
+            else -> null // Default (not set)
         }
     }
 
-    // lấy CaptureMode từ chuỗi
+    // Get the CaptureMode from a string
     private fun getCaptureMode(mode: String): Int {
         return when (mode) {
             "maximizeQuality" -> ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
@@ -398,7 +400,7 @@ class CameraPlatformView(
             it.setSurfaceProvider(previewView.surfaceProvider)
         }
 
-        //Áp dụng cài đặt CaptureMode và độ phân giải cho ImageCapture
+        //Apply the CaptureMode and resolution settings to ImageCapture
         val imageCaptureBuilder = ImageCapture.Builder()
 
         // 1. Set Capture Mode
@@ -420,28 +422,44 @@ class CameraPlatformView(
         detectionAnalyzer?.close()
         detectionAnalyzer = null
         if (detectionEnabled && !isCameraPausedManually) {
-            val analyzer = SubjectDetectionAnalyzer { imageWidth, imageHeight, detections ->
+            val analyzer = SubjectDetectionAnalyzer(context) { imageWidth, imageHeight, detections ->
                 val isFront = currentLensFacing == CameraSelector.LENS_FACING_FRONT
-                val payload = mapOf(
-                    "imageWidth" to imageWidth,
-                    "imageHeight" to imageHeight,
-                    // Analysis frames are NOT mirrored, but the preview mirrors the
-                    // front camera, so the Dart side must flip X to match.
-                    "isMirrored" to isFront,
-                    "detections" to detections
-                )
-                mainHandler.post { detectionEventSink?.success(payload) }
+                mainHandler.post {
+                    // Compute the cropped state against the actual preview bounds
+                    // (FILL_CENTER cover), matching what the user sees.
+                    val isCropped = if (detections.isEmpty()) {
+                        false
+                    } else {
+                        isSubjectCropped(detections[0], imageWidth, imageHeight, isFront)
+                    }
+                    val hasEnoughGround = if (detections.isEmpty()) {
+                        true
+                    } else {
+                        hasEnoughGroundBelow(detections[0], imageWidth, imageHeight, isFront)
+                    }
+                    val payload = mapOf(
+                        "imageWidth" to imageWidth,
+                        "imageHeight" to imageHeight,
+                        // Analysis frames are NOT mirrored, but the preview mirrors
+                        // the front camera, so the Dart side must flip X to match.
+                        "isMirrored" to isFront,
+                        "detections" to detections,
+                        "isDetected" to detections.isNotEmpty(),
+                        "isCropped" to isCropped,
+                        "hasEnoughGround" to hasEnoughGround
+                    )
+                    detectionEventSink?.success(payload)
+                }
             }
             detectionAnalyzer = analyzer
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
             analysis.setAnalyzer(analysisExecutor, analyzer)
             imageAnalysisUseCase = analysis
             Log.d(TAG, "Subject detection ImageAnalysis enabled for viewId $viewId")
         }
-
-        if (detectionEnabled) startOrientationTracking() else stopOrientationTracking()
 
         val cameraSelector = CameraSelector.Builder()
             .requireLensFacing(currentLensFacing)
@@ -516,35 +534,96 @@ class CameraPlatformView(
         }
         result.success(null)
     }
+    // Whether the detected car touches the visible preview edge (cropped),
+    // computed against the PreviewView with FILL_CENTER (cover) — matching what
+    // the user sees. Assumes cover fit (the app's usage).
+    // Whether there's enough ground beyond the car toward the configured edge
+    // (gap >= groundGuideMinFraction of the relevant preview dimension). Mapped
+    // through FILL_CENTER cover, matching what the user sees.
+    private fun hasEnoughGroundBelow(
+        box: Map<String, Any>,
+        imageWidth: Int,
+        imageHeight: Int,
+        isFront: Boolean
+    ): Boolean {
+        val vw = previewView.width.toFloat()
+        val vh = previewView.height.toFloat()
+        if (vw <= 0f || vh <= 0f || imageWidth <= 0 || imageHeight <= 0) return true
 
-    // Keeps the analysis (and capture) target rotation aligned with the device
-    // orientation so ML Kit boxes stay upright in the display's orientation.
-    // Without this, boxes are correct in portrait but drift in landscape.
-    private fun startOrientationTracking() {
-        if (orientationEventListener != null) return
-        val listener = object : OrientationEventListener(context) {
-            override fun onOrientationChanged(orientation: Int) {
-                if (orientation == ORIENTATION_UNKNOWN) return
-                val rotation = when (orientation) {
-                    in 45 until 135 -> Surface.ROTATION_270
-                    in 135 until 225 -> Surface.ROTATION_180
-                    in 225 until 315 -> Surface.ROTATION_90
-                    else -> Surface.ROTATION_0
-                }
-                imageAnalysisUseCase?.targetRotation = rotation
-                imageCapture?.targetRotation = rotation
-            }
+        var l = (box["left"] as? Double)?.toFloat() ?: return true
+        val t = (box["top"] as? Double)?.toFloat() ?: return true
+        var r = (box["right"] as? Double)?.toFloat() ?: return true
+        val b = (box["bottom"] as? Double)?.toFloat() ?: return true
+        // Front preview is mirrored; flip X so left/right match what's shown.
+        if (isFront) {
+            val nl = 1f - r
+            val nr = 1f - l
+            l = nl
+            r = nr
         }
-        if (listener.canDetectOrientation()) {
-            listener.enable()
-            orientationEventListener = listener
-            Log.d(TAG, "Orientation tracking enabled for viewId $viewId")
+
+        val imgW = imageWidth.toFloat()
+        val imgH = imageHeight.toFloat()
+        val scale = maxOf(vw / imgW, vh / imgH) // cover
+        val dispW = imgW * scale
+        val dispH = imgH * scale
+        val offX = (vw - dispW) / 2f
+        val offY = (vh - dispH) / 2f
+
+        val boxLeft = l * dispW + offX
+        val boxTop = t * dispH + offY
+        val boxRight = r * dispW + offX
+        val boxBottom = b * dispH + offY
+
+        val gap: Float
+        val dim: Float
+        when (groundGuideEdge) {
+            "top" -> { gap = boxTop; dim = vh }
+            "left" -> { gap = boxLeft; dim = vw }
+            "right" -> { gap = vw - boxRight; dim = vw }
+            else -> { gap = vh - boxBottom; dim = vh } // bottom
         }
+        return dim > 0f && (gap / dim) >= groundGuideMinFraction
     }
 
-    private fun stopOrientationTracking() {
-        orientationEventListener?.disable()
-        orientationEventListener = null
+    private fun isSubjectCropped(
+        box: Map<String, Any>,
+        imageWidth: Int,
+        imageHeight: Int,
+        isFront: Boolean
+    ): Boolean {
+        val vw = previewView.width.toFloat()
+        val vh = previewView.height.toFloat()
+        if (vw <= 0f || vh <= 0f || imageWidth <= 0 || imageHeight <= 0) return false
+
+        var l = (box["left"] as? Double)?.toFloat() ?: return false
+        val t = (box["top"] as? Double)?.toFloat() ?: return false
+        var r = (box["right"] as? Double)?.toFloat() ?: return false
+        val b = (box["bottom"] as? Double)?.toFloat() ?: return false
+
+        // Front preview is mirrored; flip X to match.
+        if (isFront) {
+            val nl = 1f - r
+            val nr = 1f - l
+            l = nl
+            r = nr
+        }
+
+        val imgW = imageWidth.toFloat()
+        val imgH = imageHeight.toFloat()
+        val scale = maxOf(vw / imgW, vh / imgH) // cover
+        val dispW = imgW * scale
+        val dispH = imgH * scale
+        val offX = (vw - dispW) / 2f
+        val offY = (vh - dispH) / 2f
+
+        val left = l * dispW + offX
+        val top = t * dispH + offY
+        val right = r * dispW + offX
+        val bottom = b * dispH + offY
+
+        val margin = minOf(vw, vh) * 0.02f
+        return left <= margin || top <= margin || right >= vw - margin || bottom >= vh - margin
     }
 
     private fun setDetectionEnabledNative(enabled: Boolean, result: MethodChannel.Result) {
@@ -596,7 +675,7 @@ class CameraPlatformView(
             return
         }
 
-        // Tạo file tạm để lưu ảnh gốc (chưa crop)
+        // Create a temp file to store the original (uncropped) photo
         val originalPhotoFile = File(context.cacheDir, "original_${SimpleDateFormat(FILENAME_FORMAT, Locale.US).format(System.currentTimeMillis())}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(originalPhotoFile).build()
 
@@ -612,15 +691,15 @@ class CameraPlatformView(
                         val croppedFilePath = cropPhotoToMatchPreview(originalFilePath, previewView)
                         if (croppedFilePath != null) {
                             Log.d(TAG, "Photo cropped successfully: $croppedFilePath")
-                            originalPhotoFile.delete() // Xóa file gốc nếu crop thành công
+                            originalPhotoFile.delete() // Delete the original file if cropping succeeded
                             flutterResult.success(croppedFilePath)
                         } else {
                             Log.e(TAG, "Photo cropping failed. Returning original photo for viewId $viewId.")
-                            flutterResult.success(originalFilePath) // Trả về ảnh gốc nếu crop lỗi
+                            flutterResult.success(originalFilePath) // Return the original photo if cropping fails
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "Exception during cropping for viewId $viewId: ${e.message}", e)
-                        flutterResult.success(originalFilePath) // Trả về ảnh gốc nếu có exception
+                        flutterResult.success(originalFilePath) // Return the original photo if an exception occurs
                     }
                 } else {
                     Log.d(TAG, "Not in cover mode. Returning original photo for viewId $viewId.")
@@ -635,10 +714,10 @@ class CameraPlatformView(
         })
     }
 
-    // HÀM MỚI ĐỂ CROP ẢNH
+    // NEW FUNCTION TO CROP THE PHOTO
     private fun cropPhotoToMatchPreview(originalPhotoPath: String, previewView: PreviewView): String? {
         try {
-            // 1. Lấy Bitmap gốc và xử lý orientation từ EXIF
+            // 1. Get the original Bitmap and handle orientation from EXIF
             val originalBitmapUnrotated = BitmapFactory.decodeFile(originalPhotoPath)
             if (originalBitmapUnrotated == null) {
                 Log.e(TAG, "Failed to decode original photo file: $originalPhotoPath")
@@ -654,7 +733,7 @@ class CameraPlatformView(
                 ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
                 ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1.0f, 1.0f)
                 ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1.0f, -1.0f)
-                // Các trường hợp phức tạp hơn có thể cần xử lý thêm
+                // More complex cases may need additional handling
             }
             val originalBitmap = Bitmap.createBitmap(originalBitmapUnrotated, 0, 0, originalBitmapUnrotated.width, originalBitmapUnrotated.height, matrix, true)
 
@@ -681,22 +760,22 @@ class CameraPlatformView(
 
             if (previewView.scaleType == PreviewView.ScaleType.FILL_CENTER) { // "cover" mode
                 if (photoAspectRatio > previewAspectRatio) {
-                    // Ảnh gốc rộng hơn preview (ví dụ: ảnh 16:9, preview 4:3)
-                    // => Preview sẽ fill chiều cao của ảnh, cắt bớt chiều rộng
+                    // Original photo is wider than the preview (e.g. 16:9 photo, 4:3 preview)
+                    // => Preview fills the photo's height and crops the width
                     cropHeight = photoHeight
                     cropWidth = photoHeight * previewAspectRatio
                     cropX = (photoWidth - cropWidth) / 2
                 } else if (photoAspectRatio < previewAspectRatio) {
-                    // Ảnh gốc cao hơn preview (ví dụ: ảnh 4:3, preview 16:9)
-                    // => Preview sẽ fill chiều rộng của ảnh, cắt bớt chiều cao
+                    // Original photo is taller than the preview (e.g. 4:3 photo, 16:9 preview)
+                    // => Preview fills the photo's width and crops the height
                     cropWidth = photoWidth
                     cropHeight = photoWidth / previewAspectRatio
                     cropY = (photoHeight - cropHeight) / 2
                 }
-                // Nếu tỷ lệ bằng nhau, không cần crop (cropWidth=photoWidth, cropHeight=photoHeight)
+                // If the aspect ratios are equal, no crop is needed (cropWidth=photoWidth, cropHeight=photoHeight)
             } else {
                 Log.w(TAG, "Cropping is currently only implemented for 'cover' (FILL_CENTER) mode.")
-                return originalPhotoPath // Trả về ảnh gốc nếu không phải cover
+                return originalPhotoPath // Return the original photo if not in cover mode
             }
 
             if (cropX < 0 || cropY < 0 || cropWidth <= 0 || cropHeight <= 0 || cropX + cropWidth > photoWidth + 0.1 || cropY + cropHeight > photoHeight + 0.1 ) {
@@ -713,20 +792,20 @@ class CameraPlatformView(
                 cropHeight.toInt()
             )
 
-            // Lưu bitmap đã crop
+            // Save the cropped bitmap
             val croppedPhotoFile = File(context.cacheDir, "cropped_${SimpleDateFormat(FILENAME_FORMAT, Locale.US).format(System.currentTimeMillis())}.jpg")
             FileOutputStream(croppedPhotoFile).use { out ->
                 croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, out) // quality 90
             }
-            croppedBitmap.recycle() // Giải phóng bộ nhớ của bitmap đã crop
-            // originalBitmap.recycle() // originalBitmap đã được xử lý bởi createBitmap với matrix
+            croppedBitmap.recycle() // Free the memory of the cropped bitmap
+            // originalBitmap.recycle() // originalBitmap was already handled by createBitmap with a matrix
 
             Log.d(TAG, "Cropped photo saved to: ${croppedPhotoFile.absolutePath}")
             return croppedPhotoFile.absolutePath
 
         } catch (e: Exception) {
             Log.e(TAG, "Error during cropPhotoToMatchPreview: ${e.message}", e)
-            return null // Trả về null nếu có lỗi, takePhoto sẽ xử lý trả về ảnh gốc
+            return null // Return null on error; takePhoto will handle returning the original photo
         }
     }
 
@@ -829,7 +908,6 @@ class CameraPlatformView(
         lifecycleOwner.lifecycle.removeObserver(this)
         isCameraPausedManually = false
         isCameraInitialized = false
-        stopOrientationTracking()
         imageAnalysisUseCase?.clearAnalyzer()
         imageAnalysisUseCase = null
         detectionAnalyzer?.close()

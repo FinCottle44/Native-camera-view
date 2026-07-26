@@ -1,69 +1,121 @@
-# Live Subject Detection & Bounding Box
+# Live Car Detection & Bounding Box
 
-This document describes the live subject/foreground bounding-box feature shipped
-in `native_camera_view`, and lays out the options for making it more capable
-(car-specific detection, outline/segmentation, tracking, custom models).
+This document describes the live car-detection bounding-box feature in
+`native_camera_view`, and lays out options for making it more capable
+(outline/segmentation, tracking, custom models).
 
 ---
 
 ## 1. What ships today
 
-A live, on-device **foreground/subject bounding box**. When enabled, the plugin
-runs a lightweight detector on the camera stream and reports a single stable box
-around the prominent subject each frame. The plugin draws it as an overlay, or
-you can draw your own.
+A live, on-device **car bounding box**. When enabled, the plugin runs a trained
+object detector on the camera stream and reports a single stable box around the
+most prominent car each frame. The box is drawn in `#6E23FE`, turning **red when
+the car touches a frame edge** (i.e. it's likely cropped). The purpose is to
+help users frame the whole car — it's **advisory only and never blocks capture**.
 
 Key properties:
 
-- **No model files.** Both platforms use OS/SDK-bundled detectors.
-- **Opt-in.** Nothing runs unless you pass `enableDetection: true`. No ML work,
-  no analysis frames, no battery cost otherwise.
-- **Single, stable box.** Native selects one primary subject (largest box above
-  size/confidence thresholds) and Dart applies temporal smoothing, so you get
-  one box that tracks smoothly instead of a flickering swarm.
-- **Orientation-aware.** Boxes stay aligned in portrait and landscape (Android
-  tracks display rotation; iOS orients the Vision request to the device).
-- **Not car-specific.** It finds the prominent *foreground subject*, not "a car"
-  by identity. Point it at a car and the car is the subject, but a person or a
-  chair in frame would be boxed too. See §5.2 for car-specific detection.
+- **Trained car detector.** Bundled EfficientDet-Lite0 (COCO), filtered to the
+  `car` class — a real car detection, not a generic saliency/foreground guess.
+- **Bundled model, permissive license.** The `.tflite` ships inside the app
+  (~7.3 MB, the **float16** build); EfficientDet-Lite0 is Apache-2.0 (safe for
+  closed-source apps). Float16 (not int8) is used so the MediaPipe **GPU/Metal**
+  delegate can run it — the int8 build only runs on CPU.
+- **Opt-in.** Nothing runs unless you pass `enableDetection: true`.
+- **Single, stable box.** Only the largest car is emitted, and the box is
+  temporally smoothed (EMA + a short hold on missed frames) so it tracks smoothly
+  instead of flickering. On iOS the smoothing is native; on Android it runs in
+  the Dart controller.
+- **Single-orientation detection (configurable).** The consuming app runs
+  landscape-left only, where the car is found on the un-rotated frame, so
+  detection runs a single pass (`.up`) — no orientation sensing, no wasted
+  inference. The rotation-tolerant machinery is still present: adding
+  `[.right, .left, .down]` to `detectionOrientationCandidates` restores detection
+  in any holding (at the cost of extra inference while acquiring). While tracking,
+  only the last winning orientation is re-checked, so it stays one inference.
+- **iOS draws the box natively on the preview.** The box is a `CAShapeLayer`
+  positioned via the preview layer's own `layerRectConverted(fromMetadataOutputRect:)`,
+  so it lands exactly where the preview shows the car (no Dart-side coordinate
+  mapping). Path changes are animated (~0.12s) so the box glides at the display
+  refresh rate instead of stepping at the ~10fps detection rate. Android draws it
+  with the Dart overlay (`CustomPaint`).
+- **Advisory only.** Detection never touches the capture path — a missed or
+  wrong detection can never prevent taking a photo.
 
 ### Platform backends
 
+Both platforms run the **same** bundled EfficientDet-Lite0 model via **MediaPipe
+Tasks Vision** `ObjectDetector`, so behaviour is consistent.
+
 | | Android | iOS |
 |---|---|---|
-| Runtime | ML Kit Object Detection (bundled) | Vision framework (`VNGenerateObjectnessBasedSaliencyImageRequest`) |
-| Frame source | CameraX `ImageAnalysis` use case | existing `AVCaptureVideoDataOutput` |
-| Min OS | API 21 | iOS 13 (no-op below) |
-| Primary box | largest object above thresholds | largest salient region above thresholds |
-| Labels | none (classification off) | none (saliency has no class) |
-| Confidence | not provided | provided per salient region |
-| Tracking id | provided (stream mode) | not provided |
-| Orientation | `targetRotation` follows the device | Vision orientation follows the device |
+| Runtime | MediaPipe `tasks-vision` | MediaPipe `MediaPipeTasksVision` |
+| Model | `efficientdet_lite0.tflite` (bundled asset) | same file (bundled resource) |
+| Frame source | CameraX `ImageAnalysis` (RGBA) | existing `AVCaptureVideoDataOutput` |
+| Min OS | API 24 | iOS 13 |
+| Class filter | `car`, filtered in code | `car`, filtered in code |
+| Primary box | largest detected car | largest detected car |
+| Orientation | single-pass `.up` (landscape-left; configurable) | single-pass `.up` (landscape-left; configurable) |
+| Box drawing | Dart `CustomPaint` overlay | native `CAShapeLayer` on the preview |
+| Smoothing | Dart controller (EMA) | native (EMA + grace frames) |
 
-The two backends are not identical: ML Kit returns the prominent *object*,
-Vision returns *visually salient* regions. Both are a reasonable "subject box";
-the difference is documented rather than hidden.
+### iOS integration requirement
+
+MediaPipe ships a **static** xcframework, so apps consuming this plugin must set
+static linkage in their `ios/Podfile`:
+
+```ruby
+target 'Runner' do
+  use_frameworks! :linkage => :static
+  ...
+end
+```
+
+Without this the build fails with `Unable to find module dependency:
+'MediaPipeTasksVision'`. The example app's Podfile already does this.
 
 ### Tuning knobs
 
-- `enableDetection` — turn the pipeline on (default off).
-- `showDetectionBox` — draw the built-in overlay (default on).
-- `detectionBoxColor` / `detectionBoxStrokeWidth` — overlay style.
+All the on-screen helpers are toggleable at widget instantiation:
+
+- `enableDetection` — master switch for the pipeline (default off). Nothing runs
+  unless this is on.
+- `showDetectionBox` — draw the bounding box (default on).
+- `showGroundGuide` — draw the translucent "ground guide" band below the car
+  (default off). A cue to leave enough ground/foreground beneath the car:
+  ~30% purple when there's enough, red when not.
+- `groundGuideMinFraction` — minimum ground beyond the car, as a fraction of the
+  relevant preview dimension, to count as sufficient (default 0.15). Below this
+  the guide turns red and `controller.hasEnoughGround` is false.
+- `groundGuideEdge` — which edge the ground lies toward: `bottom` (default),
+  `top`, `left`, or `right`. A portrait-locked app held in landscape-left should
+  use `GroundGuideEdge.left`.
+- `detectionBoxColor` — box color when the car is fully in frame (default
+  `#6E23FE`). Reused (at 30% alpha) for the "enough ground" band.
+- `croppedBoxColor` — box color when the car touches an edge (default red
+  `#FF3B30`). Reused (at 30% alpha) for the "not enough ground" band.
+- `croppedEdgeMargin` — edge margin for the cropped check, as a fraction of the
+  smaller preview dimension (default 0.02).
+- `detectionBoxStrokeWidth` — overlay stroke width.
 - `detectionSmoothing` — 0.0..1.0 EMA factor (default 0.4; higher = snappier,
   0.0 disables smoothing).
-- Native filter thresholds live in `SubjectDetectionAnalyzer.kt`
-  (`MIN_RELATIVE_AREA`, `MIN_LABEL_CONFIDENCE`) and `CameraPreview.swift`
-  (`detectionMinRelativeArea`, `detectionMinConfidence`).
+- Native score threshold: `SCORE_THRESHOLD` in `SubjectDetectionAnalyzer.kt` and
+  `detectionMinConfidence` in `CameraPreview.swift`.
 
 ---
 
 ## 2. How it's wired
 
 ```
- Camera frame ─▶ native detector ─▶ EventChannel ─▶ Dart Stream ─▶ CustomPaint overlay
-   Android: ImageAnalysis          per-view       ValueNotifier    BoundingBoxPainter
-   iOS:     captureOutput          channel        <DetectionFrame>
+ Android: ImageAnalysis ─▶ MediaPipe ─▶ EventChannel ─▶ Dart Stream ─▶ CustomPaint overlay
+ iOS:     captureOutput  ─▶ MediaPipe ─┬▶ native CAShapeLayer on the preview (the visible box)
+                                       └▶ EventChannel ─▶ Dart Stream (for consumers/state)
 ```
+
+On iOS the visible box is drawn natively; the EventChannel is still emitted so
+Dart consumers can react to detections (e.g. a cropped-state warning). On Android
+the EventChannel drives the `CustomPaint` overlay that draws the box.
 
 ### The wire contract (EventChannel)
 
@@ -83,9 +135,8 @@ Each event is a map:
       "top":    0.22,
       "right":  0.78,
       "bottom": 0.91,
-      "confidence": 0.87,     // optional
-      "label":  "car",        // optional (absent in v1)
-      "trackingId": 4          // optional
+      "confidence": 0.87,     // detector score
+      "label":  "car"         // always "car" (category allowlist)
     }
   ]
 }
@@ -114,16 +165,20 @@ Each event is a map:
 
 ```dart
 NativeCameraView(
-  enableDetection: true,          // turn the pipeline on
-  showDetectionBox: true,         // draw the built-in overlay (default)
-  detectionBoxColor: Colors.cyan,
-  detectionSmoothing: 0.4,        // EMA smoothing (0 disables, higher = snappier)
+  enableDetection: true,               // turn the pipeline on
+  // iOS draws the box natively on the preview, so the Dart overlay is only
+  // needed on Android. Setting it true on iOS would draw a second box.
+  showDetectionBox: Platform.isAndroid,
+  detectionSmoothing: 0.4,             // Android Dart smoothing (iOS smooths natively)
   cameraPreviewFit: CameraPreviewFit.cover,
   onControllerCreated: (controller) {
     _controller = controller;
   },
 );
 ```
+
+The `label` (`"car"`) and `confidence` fields are populated on each
+`SubjectDetection`, so a custom overlay can display them.
 
 Toggle at runtime:
 
@@ -147,64 +202,105 @@ ValueListenableBuilder<DetectionFrame>(
 
 ## 4. Known limitations
 
-- **Orientation (iOS landscape).** iOS now orients the Vision request from the
-  live device orientation. The portrait mapping is verified; the landscape and
-  upside-down (and front-camera) mappings are *derived* from it, not yet
-  device-verified. If a specific orientation is off, it's a one-line change in
-  `visionOrientation()` in `CameraPreview.swift`. Android tracks display rotation
-  via `OrientationEventListener` and is more robust.
-- **Fit modes.** `cover` and `contain` map exactly. `fitWidth`/`fitHeight` map to
-  the start/end alignment used natively (`FILL_START`/`FILL_END`); verify against
-  your layout if you rely on them.
-- **Backend divergence.** Android (object) vs iOS (saliency) can box slightly
-  different regions for the same scene.
-- **No labels.** It cannot tell you *what* the subject is (see §5.1 / §5.2).
-- **Accuracy.** It boxes the *prominent subject*, which is only as good as the
-  generic detector. For reliably accurate car boxes, a trained model (§5.2) is
-  required.
+- **Tuned for landscape-left.** Detection runs only the un-rotated pass, which is
+  where the car is found in the app's landscape-left usage. Other holdings won't
+  detect until you re-enable the extra rotation candidates (see §1). EfficientDet-Lite0
+  only recognizes a roughly-upright car, so a re-enabled multi-pass still flickers
+  at in-between angles (~45°) — CoreMotion would be the lever for rock-solid odd
+  angles.
+- **iOS box drawing is native; Android is Dart.** iOS positions the box via the
+  preview layer, so it's exact by construction. Android maps the display-oriented
+  box through the Dart `cover` mapping onto `PreviewView` (`FILL_CENTER`); this
+  matches in the common case but has not been device-verified as thoroughly as
+  iOS. If Android positioning is off, give it the same native treatment (CameraX
+  `CoordinateTransform` over `PreviewView`).
+- **Cropped check (iOS) is preview-frame based.** The red/edge check runs against
+  the preview bounds (what the user sees), which is what matters for framing.
+- **Single class.** Only `car` is reported. Trucks/buses/vans are ignored unless
+  you add them to the category allowlist (`SubjectDetectionAnalyzer.kt` /
+  `CameraPreview.swift`).
+- **Accuracy ceiling.** EfficientDet-Lite0 is a small, fast model. It's solid for
+  a clearly-framed car but can miss unusual angles, partial cars, or poor light.
+  A larger EfficientDet-Lite variant or a fine-tuned model (§5.2) improves this.
+- **iOS Podfile.** Consumers must use `use_frameworks! :linkage => :static` (see
+  §1).
 
 ---
 
 ## 5. Going further
 
-Roughly ordered from least to most effort.
+### 5.1 Framing state — DONE
 
-### 5.1 Enable coarse classification (small step)
+The controller exposes three `ValueNotifier<bool>`s so apps can drive framing
+warnings:
 
-ML Kit object detection can classify into 5 broad categories (fashion good, food,
-home good, place, plant). Turn on `enableClassification()` in
-`SubjectDetectionAnalyzer` and the `label`/`confidence` fields populate
-automatically (the wire contract and painter already support them). Note: **there
-is no "vehicle"/"car" category** in the base classifier, so this helps filter
-people/plants but does not identify cars.
+- `controller.isCarDetected` — a car is currently in view.
+- `controller.isCarCropped` — the detected car touches a frame edge (likely cut
+  off). Always false when no car is detected.
+- `controller.hasEnoughGround` — enough ground/foreground beneath the car (per
+  `groundGuideMinFraction`). True when no car is detected, so gate a hint on
+  `isCarDetected && !hasEnoughGround`.
 
-### 5.2 Car-specific detection (custom model)
+All are computed **natively against the visible preview** (iOS: box vs preview
+layer bounds; Android: vs `PreviewView` with `FILL_CENTER`) and sent in the
+detection payload (`isDetected` / `isCropped` / `hasEnoughGround`), so they match
+exactly what the user sees. Advisory only — they never block capture.
 
-To actually detect "car" you need a model trained on vehicle classes (COCO
-includes car/truck/bus). Two paths:
+```dart
+AnimatedBuilder(
+  animation: Listenable.merge([
+    controller.isCarDetected, controller.isCarCropped, controller.hasEnoughGround,
+  ]),
+  builder: (context, _) {
+    if (!controller.isCarDetected.value) return const SizedBox.shrink();
+    if (controller.isCarCropped.value) return const Text('Move back to fit the whole car');
+    if (!controller.hasEnoughGround.value) return const Text('Leave more ground below the car');
+    return const SizedBox.shrink();
+  },
+);
+```
 
-- **Android:** ship a TFLite detector (EfficientDet-Lite / YOLO) either via ML
-  Kit's custom-model object detection API (keeps the tracking infra) or directly
-  with the TFLite Task Library `ObjectDetector`.
-- **iOS:** ship a Core ML model (YOLOv3 and others are available from Apple's
-  model gallery) and run it with `VNCoreMLRequest` in place of the saliency
-  request. `VNRecognizedObjectObservation` already gives box + label + confidence.
+### 5.1a Ground guide overlay — DONE
 
-The EventChannel contract does not change: emit `label: "car"` and `confidence`.
-Filter to vehicle classes natively (cheap) or in Dart (flexible).
+`showGroundGuide: true` draws a translucent band from the car toward the
+`groundGuideEdge` (e.g. from the car's left edge to the left of the preview for a
+landscape-left app) — ~30% purple when there's enough ground, red when not
+(threshold `groundGuideMinFraction`). It's drawn natively on iOS (a `CAShapeLayer`
+below the box, gliding with it) and via the Dart painter on Android, reusing the
+box colors. It reads as a "ground plane" cue so users leave foreground beyond the
+car. The band and `hasEnoughGround` share the same edge + threshold, so the
+visual and the state agree.
 
-Model management to decide: bundle in the app (larger binary, offline) vs download
-on first use (smaller binary, needs network + caching).
+Note: the built-in Dart overlay (box + ground guide) only renders on **Android**;
+on **iOS** everything is drawn natively on the preview, so `showDetectionBox` /
+`showGroundGuide` can be true on both platforms without double-drawing.
+
+Note: on iOS the state is derived from the smoothed/held box, so it's stable.
+On Android it currently tracks raw detections and may flicker more; if needed,
+debounce it or move smoothing native on Android too.
+
+### 5.2 Better accuracy (bigger / fine-tuned model)
+
+The detector is a drop-in `.tflite`:
+
+- **Larger stock model:** swap `efficientdet_lite0.tflite` for `lite1`/`lite2`
+  (more accurate, slower/larger) — replace the bundled file on both platforms.
+- **Fine-tuned model:** train/fine-tune on your own car imagery (e.g. via MediaPipe
+  Model Maker) and drop in the resulting `.tflite`. Keep the label the code
+  filters on in sync (`car`).
+- **More vehicle classes:** add `truck`/`bus` to the category allowlist and
+  (optionally) relabel them as "car" for a unified box.
+
+No wire-contract or Dart changes needed for any of these.
 
 ### 5.3 Outline / segmentation (the "trace the car" ask)
 
 A box is cheap; an outline needs a segmentation mask.
 
-- **Android:** DeepLabv3 (TFLite) for semantic segmentation, or ML Kit **Subject
-  Segmentation** for a class-agnostic foreground mask.
-- **iOS:** DeepLabV3 Core ML, or Vision `VNGeneratePersonSegmentationRequest`
-  (people only). For a class-agnostic subject, the saliency request already
-  returns a low-res mask (`VNSaliencyImageObservation.pixelBuffer`).
+Since we already depend on MediaPipe Tasks Vision, the natural path is its
+**`ImageSegmenter`** (DeepLab-v3 / SelfieMulticlass models) on both platforms —
+same dependency, same bundling approach, one code path. A COCO/semantic model
+gives a vehicle mask you can trace.
 
 Delivery options for the mask:
 
@@ -218,25 +314,32 @@ detection. Masks are much heavier than boxes — throttle harder and downscale.
 
 ### 5.4 Smoothing & tracking
 
-**Done:** the primary box is EMA-smoothed in Dart (`detectionSmoothing`) and held
-through a short run of empty frames (`_maxMissFrames`) to avoid flicker on brief
-misses.
+**Done:** the primary box is EMA-smoothed and held through a short run of empty
+frames to avoid flicker on brief misses — natively on iOS (`smoothedBox` /
+`detectionMaxMissFrames` in `CameraPreview.swift`) and in the Dart controller on
+Android (`detectionSmoothing`).
 
 Further improvements if needed:
 
 - Upgrade the EMA to a one-euro filter (velocity-aware) for less lag on fast
   motion while staying stable when still.
-- Key smoothing by ML Kit's `trackingId` (already on the wire) once multiple
-  boxes are re-enabled, and add iOS tracking via `VNTrackObjectRequest`.
+- Switch the detector to MediaPipe's `.video`/`.liveStream` running mode for
+  built-in temporal association across frames.
 
 ### 5.5 Performance
 
 - Keep `STRATEGY_KEEP_ONLY_LATEST` (Android) and the time-based throttle (iOS,
-  currently ~10 fps) so inference never queues behind the camera.
-- Run inference off the main/UI thread (already the case on both platforms).
-- For TFLite, enable GPU/NNAPI delegates; for Core ML, prefer the Neural Engine.
-- Segmentation: downscale input aggressively (e.g. 256px) before inference.
-- Expose a target FPS / min-confidence knob so apps can trade accuracy for battery.
+  ~10 fps) so inference never queues behind the camera.
+- Inference runs off the main/UI thread on both platforms.
+- The GPU delegate is enabled by default (`baseOptions.delegate = .GPU` on iOS)
+  with an automatic CPU fallback. Two GPU gotchas, both handled:
+  - It requires a **float** model — the int8 build fails GPU init
+    (`quantization.type != kTfLiteAffineQuantization`) and falls back to CPU, so
+    the bundled model is float16.
+  - A single-category **`categoryAllowlist` crashes the GPU path**
+    (`Only all classes >= class 0 or >= class 1`). So no allowlist is set; we
+    filter detections to `car` in code instead (`detectLargestCar`).
+- Larger models (lite1/lite2) cost more per frame — pair with a lower throttle.
 
 ---
 
@@ -245,10 +348,11 @@ Further improvements if needed:
 | Concern | File |
 |---|---|
 | Dart data model + wire contract | `lib/detection/subject_detection.dart` |
-| Overlay painter + coordinate mapping | `lib/detection/bounding_box_painter.dart` |
-| Controller stream + enable/disable | `lib/camera_controller.dart` |
+| Overlay painter + crop coloring | `lib/detection/bounding_box_painter.dart` |
+| Controller stream + smoothing + enable/disable | `lib/camera_controller.dart` |
 | Widget params + overlay layer | `lib/camera_preview/native_camera_view.dart` |
-| Android analyzer (ML Kit) | `android/.../SubjectDetectionAnalyzer.kt` |
+| Android detector (MediaPipe) | `android/.../SubjectDetectionAnalyzer.kt` |
 | Android use case + EventChannel | `android/.../CameraPreviewFactory.kt` |
-| iOS saliency + EventChannel | `ios/Classes/CameraPreview.swift` |
-| ML Kit dependency | `android/build.gradle` |
+| iOS detector + EventChannel | `ios/Classes/CameraPreview.swift` |
+| MediaPipe dependency | `android/build.gradle`, `ios/native_camera_view.podspec` |
+| Bundled model | `android/src/main/assets/efficientdet_lite0.tflite`, `ios/Resources/efficientdet_lite0.tflite` |

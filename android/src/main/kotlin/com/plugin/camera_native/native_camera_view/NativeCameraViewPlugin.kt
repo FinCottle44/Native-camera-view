@@ -1,7 +1,7 @@
 package com.plugin.camera_native.native_camera_view
 
-import androidx.annotation.NonNull // QUAN TRỌNG: Import cho @NonNull
-// import androidx.lifecycle.DefaultLifecycleObserver // Không cần thiết nếu không dùng trực tiếp
+import androidx.annotation.NonNull // IMPORTANT: Import for @NonNull
+// import androidx.lifecycle.DefaultLifecycleObserver // Not needed unless used directly
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -30,7 +30,7 @@ class NativeCameraViewPlugin : FlutterPlugin, ActivityAware {
   override fun onAttachedToActivity(binding: ActivityPluginBinding) {
     print("NativeCameraViewPlugin: onAttachedToActivity - Registering CameraPreviewFactory")
     this.activityPluginBinding = binding
-    // val activityLifecycle = FlutterLifecycleAdapter.getActivityLifecycle(binding.lifecycle) // Lấy lifecycle từ activity
+    // val activityLifecycle = FlutterLifecycleAdapter.getActivityLifecycle(binding.lifecycle) // Get the lifecycle from the activity
 
     val messenger = flutterPluginBinding?.binaryMessenger
     if (messenger == null) {
@@ -44,33 +44,33 @@ class NativeCameraViewPlugin : FlutterPlugin, ActivityAware {
       return
     }
 
-    // Tạo và đăng ký factory
-    // Activity chính là LifecycleOwner cần thiết cho CameraPreviewFactory
+    // Create and register the factory
+    // The activity is the LifecycleOwner required by CameraPreviewFactory
     cameraPreviewFactory = CameraPreviewFactory(messenger, activity)
     flutterPluginBinding?.platformViewRegistry?.registerViewFactory(
-      viewType, // Sử dụng viewType đã định nghĩa
-      cameraPreviewFactory!! // Sử dụng !! vì chúng ta vừa tạo nó
+      viewType, // Use the defined viewType
+      cameraPreviewFactory!! // Use !! since we just created it
     )
     print("NativeCameraViewPlugin: CameraPreviewFactory registered successfully with viewType: $viewType")
   }
 
   override fun onDetachedFromActivityForConfigChanges() {
     print("NativeCameraViewPlugin: onDetachedFromActivityForConfigChanges")
-    // Gọi onDetachedFromActivity để dọn dẹp
+    // Call onDetachedFromActivity to clean up
     onDetachedFromActivity()
   }
 
   override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
     print("NativeCameraViewPlugin: onReattachedToActivityForConfigChanges")
-    // Gọi lại onAttachedToActivity để đăng ký lại factory
+    // Call onAttachedToActivity again to re-register the factory
     onAttachedToActivity(binding)
   }
 
   override fun onDetachedFromActivity() {
     print("NativeCameraViewPlugin: onDetachedFromActivity - Cleaning up")
     this.activityPluginBinding = null
-    // this.activityLifecycle = null // Không cần thiết nếu không lưu trữ
-    this.cameraPreviewFactory = null // Gỡ bỏ tham chiếu đến factory
+    // this.activityLifecycle = null // Not needed unless stored
+    this.cameraPreviewFactory = null // Remove the reference to the factory
     print("NativeCameraViewPlugin: Cleaned up activity attachments.")
   }
 }

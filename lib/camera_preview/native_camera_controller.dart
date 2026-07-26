@@ -4,33 +4,33 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-// Import service class giao tiếp với native MethodChannel của bạn
+// Import the service class that communicates with your native MethodChannel
 import '../camera_controller.dart';
 
-/// Quản lý trạng thái và logic cho NativeCameraView.
+/// Manages the state and logic for NativeCameraView.
 class NativeCameraController {
-  /// Controller để giao tiếp với native qua MethodChannel.
-  /// Sẽ được khởi tạo trong `onPlatformViewCreated`.
+  /// Controller for communicating with native code via MethodChannel.
+  /// Will be initialized in `onPlatformViewCreated`.
   CameraController? _nativeServiceController;
 
-  /// Callback để truyền `CameraController` đã được khởi tạo lên widget cha.
+  /// Callback to pass the initialized `CameraController` up to the parent widget.
   final Function(CameraController controller) onControllerCreated;
 
-  // --- Các ValueNotifier để quản lý trạng thái ---
+  // --- ValueNotifiers for managing state ---
   final ValueNotifier<bool> isLoading = ValueNotifier(true);
   final ValueNotifier<bool> isPermissionGranted = ValueNotifier(false);
 
-  /// Dùng cho các sự kiện chỉ xảy ra một lần, ví dụ như hiển thị SnackBar.
+  /// Used for one-time events, for example showing a SnackBar.
   final ValueNotifier<String?> snackbarMessage = ValueNotifier(null);
 
-  /// Constructor: Nhận callback và bắt đầu xin quyền ngay lập tức.
+  /// Constructor: receives the callback and starts requesting permission immediately.
   NativeCameraController({required this.onControllerCreated}) {
     // requestCameraPermission();
   }
 
-  // --- Các phương thức logic ---
+  // --- Logic methods ---
 
-  /// Được gọi từ view khi native PlatformView đã sẵn sàng.
+  /// Called from the view when the native PlatformView is ready.
   void onPlatformViewCreated(int id) {
     const String baseChannelName = "com.plugin.camera_native.native_camera_view/camera_method_channel";
     final String channelName = Platform.isIOS ? '${baseChannelName}_ios_$id' : '${baseChannelName}_$id';
@@ -50,14 +50,14 @@ class NativeCameraController {
   Future<void> _handleNativeMethodCall(MethodCall call) async {
     switch (call.method) {
       case 'onCameraReady':
-        // Native báo camera đã sẵn sàng -> ẩn loading
+        // Native reports the camera is ready -> hide loading
         if (isLoading.value) {
           isLoading.value = false;
           debugPrint("Native camera is ready. Hiding loading indicator.");
         }
         break;
       case 'onCameraError':
-        // Native báo có lỗi -> ẩn loading và hiển thị thông báo
+        // Native reports an error -> hide loading and show a message
         if (isLoading.value) {
           isLoading.value = false;
         }
@@ -67,30 +67,30 @@ class NativeCameraController {
         debugPrint("Native camera failed to initialize: $message");
         break;
       default:
-        // Bỏ qua các phương thức không xác định
+        // Ignore unknown methods
         break;
     }
   }
 
-  /// SỬA ĐỔI HÀM NÀY ĐỂ XỬ LÝ QUYỀN ĐÚNG CÁCH
-  /// Yêu cầu quyền truy cập camera từ người dùng.
+  /// MODIFY THIS FUNCTION TO HANDLE PERMISSIONS CORRECTLY
+  /// Requests camera access permission from the user.
   Future<void> requestCameraPermission() async {
     // isLoading.value = true;
     //
-    // // Đối với CẢ iOS và Android, chúng ta sẽ để cho native view tự xử lý việc
-    // // kiểm tra quyền và hiển thị dialog. Vai trò của Flutter chỉ là build native view.
+    // // For BOTH iOS and Android, we let the native view handle
+    // // checking permissions and showing the dialog. Flutter's role is only to build the native view.
     // debugPrint("[Flutter Permission] Skipping Dart permission request. Native will handle it.");
     // isPermissionGranted.value = true;
     //
     // isLoading.value = false;
   }
 
-  /// Xóa tin nhắn snackbar sau khi đã hiển thị.
+  /// Clears the snackbar message after it has been shown.
   void clearSnackbarMessage() {
     snackbarMessage.value = null;
   }
 
-  /// Dọn dẹp tài nguyên để tránh rò rỉ bộ nhớ.
+  /// Cleans up resources to avoid memory leaks.
   void dispose() {
     isLoading.dispose();
     isPermissionGranted.dispose();

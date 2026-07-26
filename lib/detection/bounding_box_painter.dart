@@ -9,6 +9,10 @@ import 'package:flutter/material.dart';
 import '../camera_controller.dart' show CameraPreviewFit;
 import 'subject_detection.dart';
 
+/// Which screen edge the "ground" lies toward in the fixed preview. For a
+/// portrait-locked app held in landscape-left, the ground is toward the left.
+enum GroundGuideEdge { bottom, top, left, right }
+
 /// Converts a single [SubjectDetection] (normalized, image space) into a pixel
 /// [Rect] in the coordinate space of a preview widget of [widgetSize], applying
 /// the same scaling/cropping that the native preview uses for [fit], plus
@@ -105,30 +109,62 @@ Rect? mapDetectionToWidget({
   );
 }
 
-/// Paints bounding boxes for a [DetectionFrame] over the preview.
+/// Returns true when [rect] touches (or exceeds) the bounds of [size] within
+/// [marginPx] on any edge — i.e. the subject is likely cropped by the frame.
+bool isRectCropped(Rect rect, Size size, double marginPx) {
+  return rect.left <= marginPx ||
+      rect.top <= marginPx ||
+      rect.right >= size.width - marginPx ||
+      rect.bottom >= size.height - marginPx;
+}
+
+/// Paints the car bounding box for a [DetectionFrame] over the preview. The box
+/// is drawn in [color] normally and [croppedColor] when it touches a frame edge
+/// (the car is likely cropped).
 class BoundingBoxPainter extends CustomPainter {
   final DetectionFrame frame;
   final CameraPreviewFit fit;
   final Color color;
+  final Color croppedColor;
   final double strokeWidth;
   final bool showLabel;
+
+  /// Fraction of the smaller widget dimension used as the edge margin for the
+  /// cropped check.
+  final double edgeMargin;
+
+  /// Whether to draw the bounding box itself.
+  final bool showBox;
+
+  /// Whether to draw the translucent ground guide band below the car.
+  final bool showGroundGuide;
+
+  /// Minimum ground beyond the car (fraction of the relevant widget dimension)
+  /// for the guide to count as sufficient (drawn in [color] not [croppedColor]).
+  final double groundMinFraction;
+
+  /// Which edge the ground guide extends from.
+  final GroundGuideEdge groundEdge;
 
   BoundingBoxPainter({
     required this.frame,
     required this.fit,
-    this.color = const Color(0xFF00E5FF),
+    this.color = const Color(0xFF6E23FE),
+    this.croppedColor = const Color(0xFFFF3B30),
     this.strokeWidth = 3.0,
     this.showLabel = true,
+    this.edgeMargin = 0.02,
+    this.showBox = true,
+    this.showGroundGuide = false,
+    this.groundMinFraction = 0.15,
+    this.groundEdge = GroundGuideEdge.bottom,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
     if (frame.detections.isEmpty) return;
 
-    final boxPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = strokeWidth
-      ..color = color;
+    final marginPx = edgeMargin * math.min(size.width, size.height);
 
     for (final detection in frame.detections) {
       final rect = mapDetectionToWidget(
@@ -141,16 +177,62 @@ class BoundingBoxPainter extends CustomPainter {
       );
       if (rect == null) continue;
 
-      final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(8));
-      canvas.drawRRect(rrect, boxPaint);
+      final cropped = isRectCropped(rect, size, marginPx);
 
-      if (showLabel && (detection.label != null || detection.confidence != null)) {
-        _paintLabel(canvas, rect, detection);
+      // Ground guide: translucent band from the car toward the ground edge.
+      // Drawn first so the box sits on top. Purple when there's enough ground
+      // beyond the car, red when not.
+      if (showGroundGuide) {
+        final (Rect band, double gap, double dim) = switch (groundEdge) {
+          GroundGuideEdge.bottom => (
+              Rect.fromLTRB(0, rect.bottom.clamp(0.0, size.height), size.width, size.height),
+              size.height - rect.bottom,
+              size.height,
+            ),
+          GroundGuideEdge.top => (
+              Rect.fromLTRB(0, 0, size.width, rect.top.clamp(0.0, size.height)),
+              rect.top,
+              size.height,
+            ),
+          GroundGuideEdge.left => (
+              Rect.fromLTRB(0, 0, rect.left.clamp(0.0, size.width), size.height),
+              rect.left,
+              size.width,
+            ),
+          GroundGuideEdge.right => (
+              Rect.fromLTRB(rect.right.clamp(0.0, size.width), 0, size.width, size.height),
+              size.width - rect.right,
+              size.width,
+            ),
+        };
+        if (dim > 0 && band.width > 0 && band.height > 0) {
+          final bool enough = (gap / dim) >= groundMinFraction;
+          final Paint fill = Paint()
+            ..style = PaintingStyle.fill
+            ..color = (enough ? color : croppedColor).withValues(alpha: 0.30);
+          canvas.drawRect(band, fill);
+        }
+      }
+
+      if (showBox) {
+        final drawColor = cropped ? croppedColor : color;
+        final boxPaint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = strokeWidth
+          ..color = drawColor;
+
+        final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(8));
+        canvas.drawRRect(rrect, boxPaint);
+
+        if (showLabel && (detection.label != null || detection.confidence != null)) {
+          _paintLabel(canvas, rect, detection, drawColor);
+        }
       }
     }
   }
 
-  void _paintLabel(Canvas canvas, Rect rect, SubjectDetection detection) {
+  void _paintLabel(
+      Canvas canvas, Rect rect, SubjectDetection detection, Color bgColor) {
     final labelParts = <String>[];
     if (detection.label != null) labelParts.add(detection.label!);
     if (detection.confidence != null) {
@@ -176,7 +258,7 @@ class BoundingBoxPainter extends CustomPainter {
       textPainter.width,
       textPainter.height + 4,
     );
-    canvas.drawRect(bgRect, Paint()..color = color);
+    canvas.drawRect(bgRect, Paint()..color = bgColor);
     textPainter.paint(canvas, Offset(bgRect.left, bgRect.top + 2));
   }
 
@@ -185,7 +267,13 @@ class BoundingBoxPainter extends CustomPainter {
     return oldDelegate.frame != frame ||
         oldDelegate.fit != fit ||
         oldDelegate.color != color ||
+        oldDelegate.croppedColor != croppedColor ||
         oldDelegate.strokeWidth != strokeWidth ||
-        oldDelegate.showLabel != showLabel;
+        oldDelegate.showLabel != showLabel ||
+        oldDelegate.edgeMargin != edgeMargin ||
+        oldDelegate.showBox != showBox ||
+        oldDelegate.showGroundGuide != showGroundGuide ||
+        oldDelegate.groundMinFraction != groundMinFraction ||
+        oldDelegate.groundEdge != groundEdge;
   }
 }

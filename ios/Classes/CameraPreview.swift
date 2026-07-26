@@ -2,17 +2,97 @@
 import Flutter
 import UIKit
 import AVFoundation
-import Vision
+import CoreImage
+import MediaPipeTasksVision
 
-// Lớp UIView tùy chỉnh để quản lý frame của previewLayer
+// Custom UIView subclass to manage the previewLayer's frame + the native box.
 class CameraHostView: UIView {
     var previewLayer: AVCaptureVideoPreviewLayer?
+
+    // Translucent "ground guide" fill, drawn below the box.
+    lazy var groundGuideLayer: CAShapeLayer = {
+        let l = CAShapeLayer()
+        l.strokeColor = UIColor.clear.cgColor
+        l.fillColor = UIColor.clear.cgColor
+        return l
+    }()
+
+    // Native bounding-box overlay drawn directly on top of the preview.
+    lazy var detectionBoxLayer: CAShapeLayer = {
+        let l = CAShapeLayer()
+        l.fillColor = UIColor.clear.cgColor
+        l.lineWidth = 4
+        l.strokeColor = UIColor.clear.cgColor
+        return l
+    }()
+
     override func layoutSubviews() {
         super.layoutSubviews()
         previewLayer?.frame = self.bounds
+        // Ground guide sits below the box (added first).
+        if groundGuideLayer.superlayer == nil {
+            layer.addSublayer(groundGuideLayer)
+        }
+        if detectionBoxLayer.superlayer == nil {
+            layer.addSublayer(detectionBoxLayer)
+        }
+        groundGuideLayer.frame = self.bounds
+        detectionBoxLayer.frame = self.bounds
     }
+
+    /// Draws (or clears) the translucent ground band. Glides with the box.
+    /// Must be called on the main thread.
+    func updateGroundGuide(rect: CGRect?, color: UIColor) {
+        guard let r = rect else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            groundGuideLayer.path = nil
+            CATransaction.commit()
+            return
+        }
+        let newPath = UIBezierPath(rect: r).cgPath
+        let firstAppearance = (groundGuideLayer.path == nil)
+        CATransaction.begin()
+        if firstAppearance {
+            CATransaction.setDisableActions(true)
+        } else {
+            CATransaction.setAnimationDuration(0.12)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+        }
+        groundGuideLayer.path = newPath
+        groundGuideLayer.fillColor = color.cgColor
+        CATransaction.commit()
+    }
+
+    /// Draws (or clears) the detection box in this view's coordinate space.
+    /// Detections arrive at ~10fps; animating the path change makes the box
+    /// glide smoothly at the display refresh rate instead of stepping.
+    /// Must be called on the main thread.
+    func updateDetectionBox(rect: CGRect?, color: UIColor) {
+        guard let r = rect else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true) // clear instantly
+            detectionBoxLayer.path = nil
+            CATransaction.commit()
+            return
+        }
+        let newPath = UIBezierPath(roundedRect: r, cornerRadius: 10).cgPath
+        // Snap on first appearance; glide on subsequent updates.
+        let firstAppearance = (detectionBoxLayer.path == nil)
+        CATransaction.begin()
+        if firstAppearance {
+            CATransaction.setDisableActions(true)
+        } else {
+            CATransaction.setAnimationDuration(0.12)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+        }
+        detectionBoxLayer.path = newPath
+        detectionBoxLayer.strokeColor = color.cgColor
+        CATransaction.commit()
+    }
+
     deinit {
-        print("[CameraHostView-\(ObjectIdentifier(self))] DEINIT: Dọn dẹp previewLayer.")
+        print("[CameraHostView-\(ObjectIdentifier(self))] DEINIT: Cleaning up previewLayer.")
         previewLayer?.removeFromSuperlayer()
         previewLayer = nil
     }
@@ -76,19 +156,41 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     private var lastFrameAsUIImage: UIImage?
     private lazy var ciContext = CIContext()
 
-    // --- Live subject detection (Vision saliency) ---
+    // --- Live car detection (MediaPipe object detection) ---
     private var detectionEventChannel: FlutterEventChannel?
     private var detectionEventSink: FlutterEventSink?
     private var detectionEnabled: Bool = false
+    // Toggleable helper overlays (set at instantiation via creationParams).
+    private var showDetectionBox: Bool = true
+    private var showGroundGuide: Bool = false
+    private var groundGuideMinFraction: CGFloat = 0.15
+    private var groundGuideEdge: String = "bottom" // bottom | top | left | right
     private var isProcessingDetection = false
     private var lastDetectionTime: CFTimeInterval = 0
     private let detectionMinInterval: CFTimeInterval = 0.1 // throttle to ~10 fps
-    // Cached device orientation (updated on the main thread) used to orient the
-    // Vision request so boxes align in every orientation, not just portrait.
-    private var currentDeviceOrientation: UIDeviceOrientation = .portrait
-    // Filtering: drop tiny salient regions and low-confidence hits.
-    private let detectionMinRelativeArea: CGFloat = 0.02
     private let detectionMinConfidence: Float = 0.3
+    private var objectDetector: ObjectDetector?
+    private var detectorInitFailed = false
+    // The consuming app is always used in landscape-left, where the car is found
+    // on the un-rotated frame — so we only detect on `.up`. To restore
+    // rotation-tolerance (any holding) at the cost of extra inference when no car
+    // is found, add [.right, .left, .down] here.
+    private let detectionOrientationCandidates: [CGImagePropertyOrientation] = [.up]
+    private var lastSuccessfulOrientationIndex = 0
+    // Temporal smoothing to steady the box: EMA on the raw normalized rect, held
+    // through a short run of empty frames to avoid flicker.
+    private var smoothedBox: CGRect?
+    private var detectionMissCount = 0
+    private let detectionMaxMissFrames = 12
+    private let detectionSmoothingFactor: CGFloat = 0.35
+    // Perf: downscale the frame before detection (the model input is ~320px, so
+    // processing full photo-resolution frames is wasted work). Also throttle the
+    // paused-capture snapshot, which otherwise renders a full-res image/frame.
+    private let detectionMaxSide: CGFloat = 512
+    private var lastPausedFrameUpdateTime: CFTimeInterval = 0
+    private let pausedFrameMinInterval: CFTimeInterval = 0.2
+
+
     
 
 
@@ -117,6 +219,18 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             if let enableDetection = params["enableDetection"] as? Bool {
                 self.detectionEnabled = enableDetection
             }
+            if let showBox = params["showDetectionBox"] as? Bool {
+                self.showDetectionBox = showBox
+            }
+            if let showGround = params["showGroundGuide"] as? Bool {
+                self.showGroundGuide = showGround
+            }
+            if let minGround = params["groundGuideMinFraction"] as? Double {
+                self.groundGuideMinFraction = CGFloat(minGround)
+            }
+            if let edge = params["groundGuideEdge"] as? String {
+                self.groundGuideEdge = edge
+            }
         }
         
         self.methodChannel = FlutterMethodChannel(
@@ -130,19 +244,6 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         super.init()
 
         self.detectionEventChannel?.setStreamHandler(self)
-
-        // Track device orientation so detection can be oriented correctly.
-        let initial = UIDevice.current.orientation
-        if initial.isPortrait || initial.isLandscape {
-            self.currentDeviceOrientation = initial
-        }
-        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(deviceOrientationChanged),
-            name: UIDevice.orientationDidChangeNotification,
-            object: nil
-        )
 
         print("[CameraPlatformView-\(viewId)] INIT with lens: \(self.currentCameraPosition == .front ? "FRONT":"BACK"). Frame: \(frame), Thread: \(Thread.current)")
 
@@ -170,21 +271,21 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             return
         }
 
-        //  Kiểm tra biến bypass trước tiên
+        //  Check the bypass flag first
         if bypassPermissionCheck {
             print("[CameraPlatformView-\(viewId)] Permission check is BYPASSED. Proceeding directly to setup.")
             self.setupCamera()
-            return // Thoát khỏi hàm sớm
+            return // Exit the function early
         }
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            // Quyền đã được cấp, tiếp tục setup camera
+            // Permission already granted, continue setting up the camera
             print("[CameraPlatformView-\(viewId)] Permission authorized.")
             self.setupCamera()
 
         case .notDetermined:
-            // Lần đầu tiên hỏi quyền, hệ thống sẽ hiển thị dialog
+            // Asking for permission for the first time; the system will show a dialog
             print("[CameraPlatformView-\(viewId)] Permission not determined. Requesting...")
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 guard let strongSelf = self, !strongSelf.isDeinitializing else { return }
@@ -193,19 +294,19 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                         strongSelf.setupCamera()
                     } else {
                         print("[CameraPlatformView-\(strongSelf.viewId)] Permission denied by user on first request.")
-                        // Có thể hiển thị một thông báo nhẹ nhàng ở đây nếu muốn, hoặc không làm gì cả
+                        // Could show a gentle message here if desired, or do nothing
                     }
                 }
             }
 
         case .denied, .restricted:
-            // Quyền đã bị từ chối trước đó hoặc bị hạn chế bởi phụ huynh/tổ chức
+            // Permission was previously denied or is restricted by a parent/organization
             print("[CameraPlatformView-\(viewId)] Permission denied previously or is restricted.")
 
-            // HIỂN THỊ THÔNG BÁO NATIVE
+            // SHOW THE NATIVE ALERT
             self.showPermissionDeniedAlert()
 
-            // (Không cần gửi lỗi về Flutter nữa nếu đã hiển thị thông báo ở đây)
+            // (No need to send an error back to Flutter once the alert is shown here)
             // DispatchQueue.main.async {
             //     if let channel = self.methodChannel, !self.isDeinitializing {
             //         channel.invokeMethod("onError", arguments: "camera_permission_denied_previously")
@@ -249,7 +350,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             newSession.sessionPreset = .photo
 
             var configurationSuccess = true
-            var setupError: Error? // Biến để lưu lỗi nếu có
+            var setupError: Error? // Variable to hold the error if any
 
             newSession.beginConfiguration()
             print("[CameraPlatformView-\(viewId)] setupCamera: newSession.beginConfiguration() called.")
@@ -276,6 +377,11 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
 
                 let newVideoDataOutput = AVCaptureVideoDataOutput()
                 newVideoDataOutput.alwaysDiscardsLateVideoFrames = true
+                // MediaPipe's MPImage(pixelBuffer:) requires 32BGRA; force it here
+                // (also fine for the CIImage-based paused-frame capture).
+                newVideoDataOutput.videoSettings = [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+                ]
                 newVideoDataOutput.setSampleBufferDelegate(strongSelf, queue: strongSelf.videoDataOutputQueue)
                 if newSession.canAddOutput(newVideoDataOutput) {
                     newSession.addOutput(newVideoDataOutput)
@@ -288,7 +394,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
 
             } catch {
                 print("[CameraPlatformView-\(viewId)] setupCamera: Error during I/O setup: \(error.localizedDescription)")
-                setupError = error // Lưu lại lỗi
+                setupError = error // Save the error
                 configurationSuccess = false
             }
 
@@ -297,7 +403,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
 
             guard configurationSuccess else {
                 print("[CameraPlatformView-\(viewId)] setupCamera: Configuration failed. Cleaning up and sending error to Flutter.")
-                // Gửi tín hiệu lỗi về Flutter
+                // Send an error signal back to Flutter
                 let errorMessage = setupError?.localizedDescription ?? "Unknown configuration error."
                 DispatchQueue.main.async {
                     strongSelf.methodChannel?.invokeMethod("onCameraError", arguments: ["message": errorMessage])
@@ -328,7 +434,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 sSelf._hostView.setNeedsLayout()
                 print("[CameraPlatformView-\(sSelf.viewId)] setupCamera: Preview layer configured for \(targetLens).")
 
-                // Gửi tín hiệu camera sẵn sàng về Flutter
+                // Send the camera-ready signal back to Flutter
                 sSelf.methodChannel?.invokeMethod("onCameraReady", arguments: nil)
             }
         }
@@ -388,6 +494,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             self.detectionEnabled = enabled
             print("[CameraPlatformView-\(viewId)] setDetectionEnabled: \(enabled)")
             result(nil)
+
         default:
             DispatchQueue.main.async { result(FlutterMethodNotImplemented) }
         }
@@ -402,18 +509,18 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             return
         }
 
-        // Nếu camera đã ở đúng vị trí và session đang chạy thì không cần làm gì
+        // If the camera is already in the correct position and the session is running, do nothing
         if self.currentCameraPosition == newPosition && (self.captureSession?.isRunning ?? false) {
             print("[CameraPlatformView-\(viewId)] Camera is already in the requested position and running.")
             result(nil)
             return
         }
 
-        // Cập nhật vị trí camera mong muốn
+        // Update the desired camera position
         self.currentCameraPosition = newPosition
         
-        // Gọi lại setupCamera để cấu hình lại toàn bộ session với camera mới.
-        // Hàm setupCamera đã được thiết kế để dọn dẹp session cũ một cách an toàn.
+        // Call setupCamera again to fully reconfigure the session with the new camera.
+        // The setupCamera function is designed to clean up the old session safely.
         print("[CameraPlatformView-\(viewId)] Triggering setupCamera for new position.")
         self.setupCamera()
         
@@ -454,7 +561,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         if self.isCameraPausedManually {
             print("[CameraPlatformView-\(viewId)] Attempting to capture PAUSED image.")
             
-            // 1. Lấy CGImage thô đã lưu
+            // 1. Get the stored raw CGImage
             guard let sourceCGImage = self.lastPausedFrameCGImage else {
                 DispatchQueue.main.async { result(FlutterError(code: "NO_PAUSED_FRAME", message: "Camera is paused, but no raw frame was stored.", details: nil)) }
                 return
@@ -471,7 +578,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 
                 var cgImageToProcess = sourceCGImage
                 
-                // 2. CROP ẢNH THÔ TRƯỚC (nếu là chế độ 'cover')
+                // 2. CROP THE RAW IMAGE FIRST (if in 'cover' mode)
                 if fitModeForCrop == "cover" {
                     print("[CameraPlatformView-\(localViewId)] Paused capture in 'cover' mode. Cropping first.")
                     var normalizedCropRect = CGRect(x: 0, y: 0, width: 1, height: 1)
@@ -479,7 +586,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                         normalizedCropRect = previewLayer.metadataOutputRectConverted(fromLayerRect: previewLayer.bounds)
                     }
                     
-                    // Chuyển đổi normalized rect thành pixel rect
+                    // Convert the normalized rect into a pixel rect
                     let originalWidth = CGFloat(sourceCGImage.width)
                     let originalHeight = CGFloat(sourceCGImage.height)
                     let pixelCropRect = CGRect(
@@ -489,7 +596,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                         height: normalizedCropRect.size.height * originalHeight
                     )
                     
-                    // Thực hiện crop
+                    // Perform the crop
                     if let croppedCGImage = sourceCGImage.cropping(to: pixelCropRect) {
                         cgImageToProcess = croppedCGImage
                         print("[CameraPlatformView-\(localViewId)] Cropping successful.")
@@ -498,11 +605,11 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                     }
                 }
                 
-                // 3. BIẾN ĐỔI ẢNH ĐÃ CROP (hoặc ảnh gốc nếu không crop)
+                // 3. TRANSFORM THE CROPPED IMAGE (or the original if not cropped)
                 var finalImage: UIImage?
                 
                 if strongSelf.currentCameraPosition == .front {
-                    // Đối với camera trước, xoay, lật ngang và lật dọc
+                    // For the front camera, rotate, flip horizontally and flip vertically
                     let mirroredAndRotatedImage = UIImage(cgImage: cgImageToProcess, scale: 1.0, orientation: .leftMirrored)
                     
                     UIGraphicsBeginImageContextWithOptions(mirroredAndRotatedImage.size, false, mirroredAndRotatedImage.scale)
@@ -515,11 +622,11 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                     }
                     if finalImage == nil { finalImage = mirroredAndRotatedImage } // Fallback
                     
-                } else { // Camera sau
+                } else { // Back camera
                     finalImage = UIImage(cgImage: cgImageToProcess, scale: 1.0, orientation: .right)
                 }
                 
-                // 4. LƯU ẢNH CUỐI CÙNG
+                // 4. SAVE THE FINAL IMAGE
                 guard let imageToSave = finalImage else {
                     result(FlutterError(code: "PROCESS_FAILED", message: "Failed to create final UIImage.", details: nil))
                     return
@@ -527,10 +634,10 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 
                 strongSelf.saveImageDataAndReturnPath(imageToSave.jpegData(compressionQuality: 0.9), viewId: localViewId, resultCallback: result)
             }
-            return // Kết thúc sớm vì đã xử lý bất đồng bộ
+            return // Return early since processing is asynchronous
         }
 
-            // Live capture (không pause)
+            // Live capture (not paused)
             print("[CameraPlatformView-\(viewId)] Attempting LIVE capture.")
             sessionQueue.async { [weak self] in
                 guard let strongSelf = self, !strongSelf.isDeinitializing else { return }
@@ -544,7 +651,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     private func showPermissionDeniedAlert() {
         DispatchQueue.main.async {
             guard let rootViewController = UIApplication.shared.keyWindow?.rootViewController else {
-                print("[CameraPlatformView-\(self.viewId)] Không tìm thấy root view controller để hiển thị thông báo.")
+                print("[CameraPlatformView-\(self.viewId)] Could not find a root view controller to present the alert.")
                 return
             }
 
@@ -553,7 +660,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
 
             let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
 
-            // Thêm nút "Mở Cài đặt" để đưa người dùng đến thẳng cài đặt của ứng dụng
+            // Add an "Open Settings" button to take the user straight to the app's settings
             let settingsAction = UIAlertAction(title: "Open Settings", style: .default) { _ in
                 guard let settingsUrl = URL(string: UIApplication.openSettingsURLString) else { return }
                 if UIApplication.shared.canOpenURL(settingsUrl) {
@@ -562,11 +669,11 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             }
             alertController.addAction(settingsAction)
 
-            // Thêm nút "Đóng"
+            // Add a "Close" button
             let closeAction = UIAlertAction(title: "Close", style: .cancel, handler: nil)
             alertController.addAction(closeAction)
 
-            // Hiển thị thông báo
+            // Present the alert
             rootViewController.present(alertController, animated: true, completion: nil)
         }
     }
@@ -576,10 +683,10 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                                      shouldCropBasedOnRect: Bool,
                                      viewId: Int64,
                                      resultCallback: @escaping FlutterResult) {
-        // Thực hiện crop và lưu trên background thread để không block UI
+        // Perform the crop and save on a background thread to avoid blocking the UI
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let strongSelf = self else {
-                // Instance 'self' đã bị giải phóng trước khi kịp xử lý và lưu.
+                // The 'self' instance was deallocated before it could be processed and saved.
                 DispatchQueue.main.async {
                     resultCallback(FlutterError(code: "INSTANCE_GONE_SAVE", message: "Instance deallocated before image could be processed/saved.", details: nil))
                 }
@@ -589,7 +696,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             var imageToSave = originalImage
             var performActualCrop = false
 
-            // Chỉ crop nếu được yêu cầu VÀ hình chữ nhật crop hợp lệ/không phải là toàn bộ ảnh
+            // Only crop if requested AND the crop rectangle is valid/not the entire image
             if shouldCropBasedOnRect {
                 if !(normalizedCropRect.equalTo(CGRect(x: 0, y: 0, width: 1, height: 1))) && normalizedCropRect.width > 0 && normalizedCropRect.height > 0 {
                     performActualCrop = true
@@ -607,12 +714,12 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 }
             }
             
-            // Lưu ảnh cuối cùng (đã crop hoặc ảnh gốc)
+            // Save the final image (cropped or original)
             strongSelf.saveImageDataAndReturnPath(imageToSave.jpegData(compressionQuality: 0.9), viewId: viewId, resultCallback: resultCallback)
         }
     }
     
-    // Hàm trợ giúp để lưu ảnh và trả kết quả về Flutter
+    // Helper function to save the image and return the result to Flutter
         private func saveImageDataAndReturnPath(_ data: Data?, viewId: Int64, resultCallback: @escaping FlutterResult) {
             guard let imageDataToSave = data else {
                 DispatchQueue.main.async { resultCallback(FlutterError(code: "PROCESS_FAILED", message: "Failed to get final image data.", details: nil)) }
@@ -631,11 +738,11 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
             guard let resultCallback = self.pendingPhotoCaptureResult else {
-                // Nếu không có pending result, có thể là một capture không mong muốn, bỏ qua.
+                // If there is no pending result, this may be an unexpected capture, so ignore it.
                 print("[CameraPlatformView-\(viewId)] photoOutput called without a pending result callback.")
                 return
             }
-            self.pendingPhotoCaptureResult = nil // Luôn dọn dẹp callback
+            self.pendingPhotoCaptureResult = nil // Always clean up the callback
             
             guard !isDeinitializing else {
                 DispatchQueue.main.async { resultCallback(FlutterError(code: "INSTANCE_DEINIT_CAPTURE", message: "Instance deinitializing during photo capture.", details: nil)) }
@@ -655,7 +762,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             let localViewId = self.viewId
             let fitModeForCrop = self.currentPreviewFit.lowercased()
 
-            // Logic crop cho ảnh live vẫn được giữ nguyên
+            // The crop logic for live images is kept as is
             if fitModeForCrop == "cover" {
                 DispatchQueue.main.async { [weak self] in
                     guard let strongSelf = self else {
@@ -685,8 +792,8 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         print("[CameraPlatformView-\(viewId)] pauseCameraNative called.")
         isCameraPausedManually = true
         
-        // Khi pause, chúng ta sẽ dừng session. `lastPausedFrameImage` vẫn sẽ được giữ lại.
-        // Logic unbindAll không cần thiết vì setupCamera khi resume sẽ xử lý việc đó.
+        // On pause, we stop the session. `lastPausedFrameImage` is still retained.
+        // The unbindAll logic is unnecessary since setupCamera on resume handles that.
         self.sessionQueue.async { [weak self] in
             guard let strongSelf = self, let session = strongSelf.captureSession else {
                 DispatchQueue.main.async { result(nil) }
@@ -720,8 +827,8 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         
         isCameraPausedManually = false
         
-        // Khi resume, thay vì chỉ start lại session cũ, hãy gọi lại setupCamera.
-        // Điều này đảm bảo tất cả các use case (Preview, ImageCapture, VideoDataOutput) được bind lại đúng cách.
+        // On resume, instead of just restarting the old session, call setupCamera again.
+        // This ensures all use cases (Preview, ImageCapture, VideoDataOutput) are rebound correctly.
         print("[CameraPlatformView-\(viewId)] Triggering setupCamera on resume.")
         self.setupCamera()
         
@@ -737,122 +844,303 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         guard !isDeinitializing, output == self.videoDataOutput else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        
-        // Chỉ lưu lại CGImage thô, không thực hiện bất kỳ phép biến đổi nào ở đây
-        self.lastPausedFrameCGImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent)
+        // Keep a recent full-res frame for paused capture, but throttled. Doing
+        // this every frame at photo resolution was a major source of jank.
+        let nowTs = CACurrentMediaTime()
+        if nowTs - lastPausedFrameUpdateTime >= pausedFrameMinInterval {
+            lastPausedFrameUpdateTime = nowTs
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            self.lastPausedFrameCGImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent)
+        }
 
         // Run live subject detection on this frame (throttled, non-overlapping).
         self.runSubjectDetectionIfNeeded(on: pixelBuffer)
     }
 
-    // MARK: - Live subject detection (Vision saliency)
+    // MARK: - Live subject detection (MediaPipe object detection)
 
-    /// Runs Vision objectness saliency on [pixelBuffer] when detection is
-    /// enabled and a listener is attached, throttled to [detectionMinInterval]
-    /// and never overlapping. Emits normalized top-left-origin boxes.
-    @objc private func deviceOrientationChanged() {
-        let o = UIDevice.current.orientation
-        if o.isPortrait || o.isLandscape {
-            currentDeviceOrientation = o
+    /// Locates the bundled EfficientDet-Lite0 model across the possible bundle
+    /// layouts (framework bundle, resource bundle, main bundle).
+    private func modelPath() -> String? {
+        let candidates = [Bundle(for: type(of: self)), Bundle.main]
+        for bundle in candidates {
+            if let path = bundle.path(forResource: "efficientdet_lite0", ofType: "tflite") {
+                return path
+            }
+            if let assetsURL = bundle.url(forResource: "NativeCameraViewAssets", withExtension: "bundle"),
+               let assetsBundle = Bundle(url: assetsURL),
+               let path = assetsBundle.path(forResource: "efficientdet_lite0", ofType: "tflite") {
+                return path
+            }
+        }
+        return nil
+    }
+
+    /// Lazily creates the MediaPipe object detector. Returns nil (and disables
+    /// further attempts) if creation fails, so detection stays advisory.
+    private func ensureDetector() -> ObjectDetector? {
+        if let detector = objectDetector { return detector }
+        if detectorInitFailed { return nil }
+        guard let path = modelPath() else {
+            print("[CameraPlatformView-\(viewId)] Detection model not found in bundle.")
+            detectorInitFailed = true
+            return nil
+        }
+        func makeDetector(useGPU: Bool) throws -> ObjectDetector {
+            let options = ObjectDetectorOptions()
+            options.baseOptions.modelAssetPath = path
+            options.baseOptions.delegate = useGPU ? .GPU : .CPU
+            options.runningMode = .image
+            options.scoreThreshold = detectionMinConfidence
+            // NOTE: no categoryAllowlist — a single-category allowlist crashes the
+            // GPU delegate ("Only all classes >= class 0 or >= class 1"). We filter
+            // to "car" in code instead (see detectLargestCar).
+            options.maxResults = 25
+            return try ObjectDetector(options: options)
+        }
+        // Prefer the GPU delegate (much faster on device); fall back to CPU.
+        do {
+            objectDetector = try makeDetector(useGPU: true)
+            return objectDetector
+        } catch {
+            print("[CameraPlatformView-\(viewId)] GPU detector failed, falling back to CPU: \(error.localizedDescription)")
+        }
+        do {
+            objectDetector = try makeDetector(useGPU: false)
+            return objectDetector
+        } catch {
+            print("[CameraPlatformView-\(viewId)] Failed to create ObjectDetector: \(error.localizedDescription)")
+            detectorInitFailed = true
+            return nil
         }
     }
 
-    /// Exif orientation that makes the sensor-native buffer upright for the
-    /// current device orientation. Anchored on the known-good portrait case
-    /// (.right back / .leftMirrored front); other orientations are derived from
-    /// it. NOTE: verify each orientation on-device; if one is off it's a
-    /// one-line change here.
-    private func visionOrientation() -> CGImagePropertyOrientation {
-        let isFront = currentCameraPosition == .front
-        switch currentDeviceOrientation {
-        case .portraitUpsideDown:
-            return isFront ? .rightMirrored : .left
-        case .landscapeLeft:
-            return isFront ? .downMirrored : .down
-        case .landscapeRight:
-            return isFront ? .upMirrored : .up
-        default: // .portrait and any non-interface orientation
-            return isFront ? .leftMirrored : .right
+    /// Runs the detector on one (already-oriented) image and returns the largest
+    /// car box normalized (0..1, top-left) to THAT image's own dimensions.
+    private func detectLargestCar(
+        in ciImage: CIImage
+    ) -> (rect: CGRect, label: String, confidence: Double)? {
+        guard let detector = objectDetector else { return nil }
+        guard let cg = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return nil }
+        let w = CGFloat(cg.width)
+        let h = CGFloat(cg.height)
+        guard w > 0, h > 0 else { return nil }
+        let result: ObjectDetectorResult
+        do {
+            result = try detector.detect(image: try MPImage(uiImage: UIImage(cgImage: cg)))
+        } catch {
+            print("[CameraPlatformView-\(viewId)] Detection failed: \(error.localizedDescription)")
+            return nil
+        }
+        // Filter to cars in code (a category allowlist crashes the GPU delegate).
+        let cars = result.detections.filter { $0.categories.first?.categoryName == "car" }
+        guard let best = cars.max(by: {
+            ($0.boundingBox.width * $0.boundingBox.height) <
+                ($1.boundingBox.width * $1.boundingBox.height)
+        }) else { return nil }
+        let bb = best.boundingBox
+        let cat = best.categories.first
+        return (
+            CGRect(x: bb.minX / w, y: bb.minY / h, width: bb.width / w, height: bb.height / h),
+            cat?.categoryName ?? "car",
+            Double(cat?.score ?? 0)
+        )
+    }
+
+    /// Maps a normalized rect detected in an image that was produced by applying
+    /// [orientation] to the raw buffer, back into the raw buffer's normalized
+    /// (unrotated) space.
+    private func unrotateNormalizedRect(_ r: CGRect, from orientation: CGImagePropertyOrientation) -> CGRect {
+        switch orientation {
+        case .right: // raw rotated 90° CW to make the detection image
+            return CGRect(x: r.origin.y, y: 1 - (r.origin.x + r.size.width), width: r.size.height, height: r.size.width)
+        case .left: // raw rotated 90° CCW
+            return CGRect(x: 1 - (r.origin.y + r.size.height), y: r.origin.x, width: r.size.height, height: r.size.width)
+        case .down: // 180°
+            return CGRect(x: 1 - (r.origin.x + r.size.width), y: 1 - (r.origin.y + r.size.height), width: r.size.width, height: r.size.height)
+        default: // .up — no rotation
+            return r
         }
     }
 
     private func runSubjectDetectionIfNeeded(on pixelBuffer: CVPixelBuffer) {
         guard detectionEnabled, detectionEventSink != nil, !isProcessingDetection else { return }
-        // Vision saliency requests require iOS 13+. Silently no-op below that.
-        guard #available(iOS 13.0, *) else { return }
 
         let now = CACurrentMediaTime()
         guard now - lastDetectionTime >= detectionMinInterval else { return }
         lastDetectionTime = now
+
+        guard ensureDetector() != nil else { return }
         isProcessingDetection = true
+        defer { isProcessingDetection = false }
 
-        let orientation = visionOrientation()
-        // 90°-rotated orientations swap the upright dimensions.
-        let rotates90: Bool
-        switch orientation {
-        case .left, .right, .leftMirrored, .rightMirrored: rotates90 = true
-        default: rotates90 = false
-        }
-        let bufferWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let bufferHeight = CVPixelBufferGetHeight(pixelBuffer)
-        let uprightWidth = rotates90 ? bufferHeight : bufferWidth
-        let uprightHeight = rotates90 ? bufferWidth : bufferHeight
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return }
 
-        let request = VNGenerateObjectnessBasedSaliencyImageRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
-
-        do {
-            try handler.perform([request])
-        } catch {
-            print("[CameraPlatformView-\(viewId)] Saliency request failed: \(error.localizedDescription)")
-            isProcessingDetection = false
-            return
+        // Downscale before detection — the model input is ~320px, so running it
+        // on full photo-resolution frames is the main cost. Normalized box coords
+        // are unaffected by uniform scaling.
+        var baseCI = CIImage(cvPixelBuffer: pixelBuffer)
+        let longestSide = max(baseCI.extent.width, baseCI.extent.height)
+        if longestSide > detectionMaxSide {
+            let s = detectionMaxSide / longestSide
+            baseCI = baseCI.transformed(by: CGAffineTransform(scaleX: s, y: s))
         }
 
-        var detections: [[String: Any]] = []
-        if let observation = request.results?.first as? VNSaliencyImageObservation,
-           let salientObjects = observation.salientObjects {
-            // Keep only the single most prominent region: the largest box that
-            // passes the confidence + size thresholds.
-            let best = salientObjects
-                .filter {
-                    $0.confidence >= detectionMinConfidence &&
-                        ($0.boundingBox.width * $0.boundingBox.height) >= detectionMinRelativeArea
-                }
-                .max {
-                    ($0.boundingBox.width * $0.boundingBox.height) <
-                        ($1.boundingBox.width * $1.boundingBox.height)
-                }
-
-            if let object = best {
-                // Vision boundingBox is normalized, bottom-left origin. Flip Y to
-                // the top-left origin used by our wire contract.
-                let bb = object.boundingBox
-                let top = 1.0 - (bb.origin.y + bb.height)
-                let bottom = 1.0 - bb.origin.y
-                detections.append([
-                    "left": Double(bb.origin.x).clamped01(),
-                    "top": Double(top).clamped01(),
-                    "right": Double(bb.origin.x + bb.width).clamped01(),
-                    "bottom": Double(bottom).clamped01(),
-                    "confidence": Double(object.confidence)
-                ])
+        // Try candidate rotations (last winner first) until a car is found. The
+        // box is mapped back to the raw buffer's coordinate space so the native
+        // preview conversion draws it correctly regardless of how it was found.
+        var rawRect: CGRect?
+        var label = "car"
+        var confidence = 0.0
+        // While actively tracking, only re-check the last winning orientation (1
+        // inference). Do the full multi-orientation search only when acquiring
+        // (no box held) — this avoids a 4x inference spike on every missed frame.
+        var order = [lastSuccessfulOrientationIndex]
+        if smoothedBox == nil {
+            for i in detectionOrientationCandidates.indices where i != lastSuccessfulOrientationIndex {
+                order.append(i)
+            }
+        }
+        for idx in order {
+            let orientation = detectionOrientationCandidates[idx]
+            let image = (orientation == .up) ? baseCI : baseCI.oriented(orientation)
+            if let found = detectLargestCar(in: image) {
+                rawRect = unrotateNormalizedRect(found.rect, from: orientation)
+                label = found.label
+                confidence = found.confidence
+                lastSuccessfulOrientationIndex = idx
+                break
             }
         }
 
-        let payload: [String: Any] = [
-            "imageWidth": uprightWidth,
-            "imageHeight": uprightHeight,
+        // Clamp to [0,1].
+        let foundRect: CGRect? = rawRect.map { r in
+            let l = min(max(r.minX, 0), 1)
+            let t = min(max(r.minY, 0), 1)
+            let rr = min(max(r.maxX, 0), 1)
+            let bb = min(max(r.maxY, 0), 1)
+            return CGRect(x: l, y: t, width: max(0, rr - l), height: max(0, bb - t))
+        }
+
+        // Temporal smoothing: EMA toward the new box; hold the last box through a
+        // short run of empty frames so it doesn't flicker.
+        let displayRect: CGRect?
+        if let target = foundRect {
+            detectionMissCount = 0
+            if let prev = smoothedBox {
+                let f = detectionSmoothingFactor
+                smoothedBox = CGRect(
+                    x: prev.minX + (target.minX - prev.minX) * f,
+                    y: prev.minY + (target.minY - prev.minY) * f,
+                    width: prev.width + (target.width - prev.width) * f,
+                    height: prev.height + (target.height - prev.height) * f
+                )
+            } else {
+                smoothedBox = target
+            }
+            displayRect = smoothedBox
+        } else {
+            detectionMissCount += 1
+            if detectionMissCount > detectionMaxMissFrames {
+                smoothedBox = nil
+            }
+            displayRect = smoothedBox
+        }
+
+        var detections: [[String: Any]] = []
+        if let r = displayRect {
+            detections.append([
+                "left": Double(r.minX),
+                "top": Double(r.minY),
+                "right": Double(r.maxX),
+                "bottom": Double(r.maxY),
+                "label": label,
+                "confidence": confidence
+            ])
+        }
+
+        let basePayload: [String: Any] = [
+            "imageWidth": width,
+            "imageHeight": height,
             "isMirrored": false,
             "detections": detections
         ]
+        let isDetected = (displayRect != nil)
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self, !self.isDeinitializing else { return }
+            // Draw the overlays (box + ground guide) and get the framing state,
+            // computed against the actual preview bounds, then report to Dart.
+            let state = self.updateNativeOverlays(metadataRect: displayRect)
+            var payload = basePayload
+            payload["isDetected"] = isDetected
+            payload["isCropped"] = state.cropped
+            payload["hasEnoughGround"] = state.hasEnoughGround
             self.detectionEventSink?(payload)
         }
-        isProcessingDetection = false
+    }
+
+    /// Draws the native overlays (bounding box + ground guide) using the preview
+    /// layer's own coordinate conversion (handles the aspect-fill crop), and
+    /// returns the framing state. Main thread only.
+    /// - `cropped`: the car touches a preview edge.
+    /// - `hasEnoughGround`: enough ground beneath the car (true when no car).
+    private func updateNativeOverlays(metadataRect: CGRect?) -> (cropped: Bool, hasEnoughGround: Bool) {
+        guard let previewLayer = _hostView.previewLayer, let mRect = metadataRect else {
+            _hostView.updateDetectionBox(rect: nil, color: .clear)
+            _hostView.updateGroundGuide(rect: nil, color: .clear)
+            return (false, true)
+        }
+        let layerRect = previewLayer.layerRectConverted(fromMetadataOutputRect: mRect)
+        let b = previewLayer.bounds
+        let margin = min(b.width, b.height) * 0.02
+        let cropped = layerRect.minX <= b.minX + margin
+            || layerRect.minY <= b.minY + margin
+            || layerRect.maxX >= b.maxX - margin
+            || layerRect.maxY >= b.maxY - margin
+        let purple = UIColor(red: 0x6E / 255.0, green: 0x23 / 255.0, blue: 0xFE / 255.0, alpha: 1.0)
+        let red = UIColor(red: 1.0, green: 0x3B / 255.0, blue: 0x30 / 255.0, alpha: 1.0)
+
+        // Bounding box (optional).
+        if showDetectionBox {
+            _hostView.updateDetectionBox(rect: layerRect, color: cropped ? red : purple)
+        } else {
+            _hostView.updateDetectionBox(rect: nil, color: .clear)
+        }
+
+        // Ground guide: band from the car toward the configured ground edge.
+        let bandRect: CGRect
+        let gap: CGFloat
+        let dim: CGFloat
+        switch groundGuideEdge {
+        case "top":
+            bandRect = CGRect(x: b.minX, y: b.minY, width: b.width, height: max(0, layerRect.minY - b.minY))
+            gap = layerRect.minY - b.minY
+            dim = b.height
+        case "left":
+            bandRect = CGRect(x: b.minX, y: b.minY, width: max(0, layerRect.minX - b.minX), height: b.height)
+            gap = layerRect.minX - b.minX
+            dim = b.width
+        case "right":
+            bandRect = CGRect(x: layerRect.maxX, y: b.minY, width: max(0, b.maxX - layerRect.maxX), height: b.height)
+            gap = b.maxX - layerRect.maxX
+            dim = b.width
+        default: // bottom
+            bandRect = CGRect(x: b.minX, y: layerRect.maxY, width: b.width, height: max(0, b.maxY - layerRect.maxY))
+            gap = b.maxY - layerRect.maxY
+            dim = b.height
+        }
+        let hasEnoughGround = dim > 0 && (gap / dim) >= groundGuideMinFraction
+        if showGroundGuide {
+            let bandColor = (hasEnoughGround ? purple : red).withAlphaComponent(0.30)
+            _hostView.updateGroundGuide(rect: bandRect, color: bandColor)
+        } else {
+            _hostView.updateGroundGuide(rect: nil, color: .clear)
+        }
+
+        return (cropped, hasEnoughGround)
     }
 
     // MARK: - FlutterStreamHandler (detection EventChannel)
@@ -933,17 +1221,13 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     }
     deinit {
         isDeinitializing = true
-        NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
-        DispatchQueue.main.async {
-            UIDevice.current.endGeneratingDeviceOrientationNotifications()
-        }
         let currentViewId = self.viewId
         print("[CameraPlatformView-\(currentViewId)] DEINIT: Running on thread: \(Thread.current)")
-        print("[CameraPlatformView-\(currentViewId)] DEINIT: Bắt đầu quá trình giải phóng.")
+        print("[CameraPlatformView-\(currentViewId)] DEINIT: Starting the deallocation process.")
 
         let capturedSession = self.captureSession
         let capturedPhotoOutput = self.photoOutput
-        let capturedVideoDataOutput = self.videoDataOutput // Tham chiếu mạnh đến output
+        let capturedVideoDataOutput = self.videoDataOutput // Strong reference to the output
         let capturedCurrentCameraInput = self.currentCameraInput
         let capturedMethodChannel = self.methodChannel
         let capturedEventChannel = self.detectionEventChannel
@@ -957,52 +1241,52 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         self.sessionQueue.async { // ASYNC to avoid deadlock if deinit runs on sessionQueue
             print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.async) Starting AVFoundation cleanup...")
 
-            // 1. Dừng session
+            // 1. Stop the session
             if capturedSession?.isRunning ?? false {
                 capturedSession?.stopRunning()
-                print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Session đã dừng.")
+                print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Session stopped.")
             } else {
-                print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Session không chạy hoặc đã nil.")
+                print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Session not running or already nil.")
             }
 
-            // 2. Gỡ bỏ I/O khỏi session
+            // 2. Remove I/O from the session
             if let session = capturedSession {
                 if let photoOut = capturedPhotoOutput, session.outputs.contains(photoOut) {
                     session.removeOutput(photoOut)
                     print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) PhotoOutput removed.")
                 }
                 if let videoOut = capturedVideoDataOutput, session.outputs.contains(videoOut) {
-                    session.removeOutput(videoOut) // Gỡ output khỏi session
+                    session.removeOutput(videoOut) // Remove the output from the session
                     print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) VideoDataOutput removed from session.")
 
-                    // 3. Gỡ delegate của VideoDataOutput SAU KHI đã gỡ nó khỏi session
-                    //    Và thực hiện trên cùng sessionQueue này (hoặc videoDataOutputQueue nếu bạn muốn, nhưng sessionQueue có vẻ hợp lý hơn cho việc quản lý vòng đời output)
-                    //    Không cần dispatch riêng lên videoDataOutputQueue nữa nếu làm ở đây.
+                    // 3. Remove the VideoDataOutput delegate AFTER removing it from the session
+                    //    And do it on this same sessionQueue (or videoDataOutputQueue if you prefer, but sessionQueue seems more reasonable for managing the output's lifecycle)
+                    //    No separate dispatch onto videoDataOutputQueue is needed when done here.
                     videoOut.setSampleBufferDelegate(nil, queue: nil)
-                    print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Delegate của VideoDataOutput đã gỡ (nil).")
+                    print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) VideoDataOutput delegate removed (nil).")
                 }
                 if let camInput = capturedCurrentCameraInput, session.inputs.contains(camInput) {
                     session.removeInput(camInput)
                     print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) CameraInput removed.")
                 }
             } else {
-                print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Session đã nil, không gỡ I/O.")
+                print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) Session already nil, not removing I/O.")
             }
             print("[CameraPlatformView-\(currentViewId)] DEINIT: (sessionQueue.sync) AVFoundation cleanup finished.")
-        } // Kết thúc sessionQueue.sync
+        } // End of sessionQueue.sync
 
-        // Hủy method channel handler không đồng bộ trên main thread
+        // Remove the method channel handler asynchronously on the main thread
         DispatchQueue.main.async {
             capturedMethodChannel?.setMethodCallHandler(nil)
             capturedEventChannel?.setStreamHandler(nil)
-            print("[CameraPlatformView-\(currentViewId)] DEINIT: Method/Event channel handlers đã gỡ (async).")
+            print("[CameraPlatformView-\(currentViewId)] DEINIT: Method/Event channel handlers removed (async).")
         }
 
-        // Gán nil cho các property để giải phóng tham chiếu mạnh
-        // Các đối tượng AVFoundation đã được captured và xử lý trong sessionQueue.sync
+        // Set the properties to nil to release the strong references
+        // The AVFoundation objects were captured and handled in sessionQueue.sync
         self.captureSession = nil
         self.photoOutput = nil
-        self.videoDataOutput = nil // Property này sẽ được ARC giải phóng sau khi capturedVideoDataOutput ra khỏi scope
+        self.videoDataOutput = nil // This property will be released by ARC after capturedVideoDataOutput goes out of scope
         self.currentCameraInput = nil
         self.methodChannel = nil
         self.detectionEventChannel = nil
@@ -1010,7 +1294,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         self.pendingPhotoCaptureResult = nil
         self.lastFrameAsUIImage = nil
 
-        print("[CameraPlatformView-\(currentViewId)] DEINIT: Hoàn tất quá trình giải phóng (synchronous part).")
+        print("[CameraPlatformView-\(currentViewId)] DEINIT: Completed the deallocation process (synchronous part).")
     }
 }
 
