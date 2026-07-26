@@ -9,12 +9,21 @@ import MediaPipeTasksVision
 class CameraHostView: UIView {
     var previewLayer: AVCaptureVideoPreviewLayer?
 
-    // Translucent "ground guide" fill, drawn below the box.
-    lazy var groundGuideLayer: CAShapeLayer = {
-        let l = CAShapeLayer()
-        l.strokeColor = UIColor.clear.cgColor
-        l.fillColor = UIColor.clear.cgColor
-        return l
+    // Translucent "ground guide" fill, drawn below the box. A gradient (opaque
+    // at the ground-side edge, fading to transparent as it meets the car) is
+    // masked to a shape: the ground strip with the car region punched out
+    // (even-odd), so the band laps up the sides of the box without covering it.
+    lazy var groundGuideGradient: CAGradientLayer = {
+        let g = CAGradientLayer()
+        g.startPoint = CGPoint(x: 0, y: 0.5)
+        g.endPoint = CGPoint(x: 1, y: 0.5)
+        return g
+    }()
+    private lazy var groundGuideMask: CAShapeLayer = {
+        let m = CAShapeLayer()
+        m.fillRule = .evenOdd
+        m.fillColor = UIColor.black.cgColor
+        return m
     }()
 
     // Native bounding-box overlay drawn directly on top of the preview.
@@ -30,28 +39,31 @@ class CameraHostView: UIView {
         super.layoutSubviews()
         previewLayer?.frame = self.bounds
         // Ground guide sits below the box (added first).
-        if groundGuideLayer.superlayer == nil {
-            layer.addSublayer(groundGuideLayer)
+        if groundGuideGradient.superlayer == nil {
+            layer.addSublayer(groundGuideGradient)
         }
         if detectionBoxLayer.superlayer == nil {
             layer.addSublayer(detectionBoxLayer)
         }
-        groundGuideLayer.frame = self.bounds
+        groundGuideGradient.frame = self.bounds
+        groundGuideMask.frame = self.bounds
+        groundGuideGradient.mask = groundGuideMask
         detectionBoxLayer.frame = self.bounds
     }
 
     /// Draws (or clears) the translucent ground band. Glides with the box.
     /// Must be called on the main thread.
-    func updateGroundGuide(rect: CGRect?, color: UIColor) {
-        guard let r = rect else {
+    func updateGroundGuide(maskPath: CGPath?, color: UIColor, startPoint: CGPoint, endPoint: CGPoint) {
+        guard let p = maskPath else {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            groundGuideLayer.path = nil
+            groundGuideMask.path = nil
             CATransaction.commit()
             return
         }
-        let newPath = UIBezierPath(rect: r).cgPath
-        let firstAppearance = (groundGuideLayer.path == nil)
+        let solid = color.withAlphaComponent(0.30).cgColor
+        let clear = color.withAlphaComponent(0.0).cgColor
+        let firstAppearance = (groundGuideMask.path == nil)
         CATransaction.begin()
         if firstAppearance {
             CATransaction.setDisableActions(true)
@@ -59,8 +71,13 @@ class CameraHostView: UIView {
             CATransaction.setAnimationDuration(0.12)
             CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
         }
-        groundGuideLayer.path = newPath
-        groundGuideLayer.fillColor = color.cgColor
+        groundGuideMask.path = p
+        // Solid for the first stretch, then fade to transparent as it meets the
+        // car so there's no harsh cutoff at the box edge.
+        groundGuideGradient.colors = [solid, solid, clear]
+        groundGuideGradient.locations = [0.0, 0.7, 1.0]
+        groundGuideGradient.startPoint = startPoint
+        groundGuideGradient.endPoint = endPoint
         CATransaction.commit()
     }
 
@@ -165,6 +182,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     private var showGroundGuide: Bool = false
     private var groundGuideMinFraction: CGFloat = 0.15
     private var groundGuideEdge: String = "bottom" // bottom | top | left | right
+    private var groundGuideOverlap: CGFloat = 0.15 // how far the band laps into the box
     private var isProcessingDetection = false
     private var lastDetectionTime: CFTimeInterval = 0
     private let detectionMinInterval: CFTimeInterval = 0.1 // throttle to ~10 fps
@@ -230,6 +248,9 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             }
             if let edge = params["groundGuideEdge"] as? String {
                 self.groundGuideEdge = edge
+            }
+            if let overlap = params["groundGuideOverlap"] as? Double {
+                self.groundGuideOverlap = CGFloat(overlap)
             }
         }
         
@@ -1090,7 +1111,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     private func updateNativeOverlays(metadataRect: CGRect?) -> (cropped: Bool, hasEnoughGround: Bool) {
         guard let previewLayer = _hostView.previewLayer, let mRect = metadataRect else {
             _hostView.updateDetectionBox(rect: nil, color: .clear)
-            _hostView.updateGroundGuide(rect: nil, color: .clear)
+            _hostView.updateGroundGuide(maskPath: nil, color: .clear, startPoint: .zero, endPoint: .zero)
             return (false, true)
         }
         let layerRect = previewLayer.layerRectConverted(fromMetadataOutputRect: mRect)
@@ -1110,34 +1131,79 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             _hostView.updateDetectionBox(rect: nil, color: .clear)
         }
 
-        // Ground guide: band from the car toward the configured ground edge.
-        let bandRect: CGRect
+        // Ground guide: a translucent band running from the ground-side edge
+        // toward the car. It laps `groundGuideOverlap` of the box into the car,
+        // fades out (gradient) as it meets the car instead of a hard cutoff, and
+        // punches the car region out (even-odd) so it never covers the car.
+        // `gap`/`dim` drive the enough-ground check (actual clearance, edge->car).
+        let strip: CGRect
         let gap: CGFloat
         let dim: CGFloat
+        let startPoint: CGPoint
+        let endPoint: CGPoint
         switch groundGuideEdge {
         case "top":
-            bandRect = CGRect(x: b.minX, y: b.minY, width: b.width, height: max(0, layerRect.minY - b.minY))
+            let ov = groundGuideOverlap * layerRect.height
+            let inner = min(layerRect.minY + ov, b.maxY)
+            strip = CGRect(x: b.minX, y: b.minY, width: b.width, height: max(0, inner - b.minY))
             gap = layerRect.minY - b.minY
             dim = b.height
+            startPoint = CGPoint(x: 0.5, y: 0.0)
+            endPoint = CGPoint(x: 0.5, y: (inner - b.minY) / b.height)
         case "left":
-            bandRect = CGRect(x: b.minX, y: b.minY, width: max(0, layerRect.minX - b.minX), height: b.height)
+            let ov = groundGuideOverlap * layerRect.width
+            let inner = min(layerRect.minX + ov, b.maxX)
+            strip = CGRect(x: b.minX, y: b.minY, width: max(0, inner - b.minX), height: b.height)
             gap = layerRect.minX - b.minX
             dim = b.width
+            startPoint = CGPoint(x: 0.0, y: 0.5)
+            endPoint = CGPoint(x: (inner - b.minX) / b.width, y: 0.5)
         case "right":
-            bandRect = CGRect(x: layerRect.maxX, y: b.minY, width: max(0, b.maxX - layerRect.maxX), height: b.height)
+            let ov = groundGuideOverlap * layerRect.width
+            let inner = max(layerRect.maxX - ov, b.minX)
+            strip = CGRect(x: inner, y: b.minY, width: max(0, b.maxX - inner), height: b.height)
             gap = b.maxX - layerRect.maxX
             dim = b.width
+            startPoint = CGPoint(x: 1.0, y: 0.5)
+            endPoint = CGPoint(x: (inner - b.minX) / b.width, y: 0.5)
         default: // bottom
-            bandRect = CGRect(x: b.minX, y: layerRect.maxY, width: b.width, height: max(0, b.maxY - layerRect.maxY))
+            let ov = groundGuideOverlap * layerRect.height
+            let inner = max(layerRect.maxY - ov, b.minY)
+            strip = CGRect(x: b.minX, y: inner, width: b.width, height: max(0, b.maxY - inner))
             gap = b.maxY - layerRect.maxY
             dim = b.height
+            startPoint = CGPoint(x: 0.5, y: 1.0)
+            endPoint = CGPoint(x: 0.5, y: (inner - b.minY) / b.height)
         }
+        let hole = strip.intersection(layerRect)
         let hasEnoughGround = dim > 0 && (gap / dim) >= groundGuideMinFraction
-        if showGroundGuide {
-            let bandColor = (hasEnoughGround ? purple : red).withAlphaComponent(0.30)
-            _hostView.updateGroundGuide(rect: bandRect, color: bandColor)
+        if showGroundGuide && strip.width > 0 && strip.height > 0 {
+            let base = hasEnoughGround ? purple : red
+            let path = UIBezierPath(rect: strip)
+            if !hole.isNull && hole.width > 0 && hole.height > 0 {
+                // Round the hole's corners that sit on the car's ground-side edge
+                // so the punched-out region follows the box's rounded corners
+                // (cornerRadius 10 in updateDetectionBox) instead of cutting a
+                // sharp corner. The inner cut stays square.
+                let boxCornerRadius: CGFloat = 10
+                let holeCorners: UIRectCorner
+                switch groundGuideEdge {
+                case "top":   holeCorners = [.topLeft, .topRight]
+                case "left":  holeCorners = [.topLeft, .bottomLeft]
+                case "right": holeCorners = [.topRight, .bottomRight]
+                default:      holeCorners = [.bottomLeft, .bottomRight] // bottom
+                }
+                let r = min(boxCornerRadius, min(hole.width, hole.height) / 2)
+                let holePath = UIBezierPath(
+                    roundedRect: hole,
+                    byRoundingCorners: holeCorners,
+                    cornerRadii: CGSize(width: r, height: r)
+                )
+                path.append(holePath) // punched out by even-odd fill rule
+            }
+            _hostView.updateGroundGuide(maskPath: path.cgPath, color: base, startPoint: startPoint, endPoint: endPoint)
         } else {
-            _hostView.updateGroundGuide(rect: nil, color: .clear)
+            _hostView.updateGroundGuide(maskPath: nil, color: .clear, startPoint: .zero, endPoint: .zero)
         }
 
         return (cropped, hasEnoughGround)

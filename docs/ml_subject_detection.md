@@ -82,15 +82,25 @@ All the on-screen helpers are toggleable at widget instantiation:
 - `enableDetection` — master switch for the pipeline (default off). Nothing runs
   unless this is on.
 - `showDetectionBox` — draw the bounding box (default on).
-- `showGroundGuide` — draw the translucent "ground guide" band below the car
-  (default off). A cue to leave enough ground/foreground beneath the car:
-  ~30% purple when there's enough, red when not.
+- `showGroundGuide` — draw the translucent "ground guide" band from the
+  ground-side edge toward the car (default off). A cue to leave enough
+  ground/foreground beside the car: ~30% purple when there's enough, red when
+  not. The band is a gradient that's solid at the phone edge and fades to
+  transparent as it meets the car (no hard cutoff), laps a little way up the
+  sides of the car, and has the car region punched out so it never paints over
+  the car itself.
 - `groundGuideMinFraction` — minimum ground beyond the car, as a fraction of the
   relevant preview dimension, to count as sufficient (default 0.15). Below this
-  the guide turns red and `controller.hasEnoughGround` is false.
+  the guide turns red and `controller.hasEnoughGround` is false. (This measures
+  the actual clearance edge→car and is independent of `groundGuideOverlap`.)
 - `groundGuideEdge` — which edge the ground lies toward: `bottom` (default),
   `top`, `left`, or `right`. A portrait-locked app held in landscape-left should
   use `GroundGuideEdge.left`.
+- `groundGuideOverlap` — how far the band laps into the car box, as a fraction
+  of the box's size along the ground axis (default 0.15). The band fades to
+  transparent as it meets the car and the car region is punched out, so the
+  ground appears to lap up around the car's ground-side corners without covering
+  the car. Set to 0.0 for a band that stops exactly at the car's edge.
 - `detectionBoxColor` — box color when the car is fully in frame (default
   `#6E23FE`). Reused (at 30% alpha) for the "enough ground" band.
 - `croppedBoxColor` — box color when the car touches an edge (default red

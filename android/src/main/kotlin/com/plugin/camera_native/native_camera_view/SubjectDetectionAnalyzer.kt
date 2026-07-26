@@ -18,11 +18,14 @@ import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
  * in frame, and reports its bounding box as normalized (0..1) top-left-origin
  * coordinates in the frame's display (upright) orientation.
  *
- * The model only reliably detects a roughly-upright car. Because the app can be
- * held in any physical orientation (while the preview stays put), detection is
- * rotation-tolerant: the display frame is tried as-is, then rotated 90/180/270
- * until a car is found, and the box is mapped back to the display frame. The
- * last winning rotation is tried first so steady-state is a single inference.
+ * The model only reliably detects a roughly-upright car. The consuming app is
+ * portrait-locked but held in landscape-left, so CameraX delivers a portrait
+ * display frame in which a real upright car sits rotated 90°. Detection therefore
+ * applies a single fixed rotation ([DETECTION_ROTATION_DEGREES]) to the display
+ * frame so the car is upright for the model, then maps the winning box back to
+ * the display frame — one inference per frame, no rotation search. To support a
+ * different holding, change that constant (or search several rotations, at the
+ * cost of extra inference while searching).
  *
  * Only the `car` category is kept, and only the single most prominent (largest)
  * car is emitted. Detection is advisory only; it never affects image capture.
@@ -41,12 +44,15 @@ class SubjectDetectionAnalyzer(
         private const val SCORE_THRESHOLD = 0.4f
         // Drop boxes smaller than this fraction of the frame area (noise).
         private const val MIN_RELATIVE_AREA = 0.02f
-        // Rotations (degrees, clockwise) tried until a car is found.
-        private val ROTATION_CANDIDATES = intArrayOf(0, 90, 180, 270)
+        // The app is portrait-locked but held in landscape-left, so a real
+        // upright car sits rotated 90° in the portrait display frame. Rotate the
+        // display frame clockwise by this much before detection so the car is
+        // upright for the model. 270 = landscape-left; use 90 for the mirror
+        // (landscape-right), or 0 to detect on the upright frame (portrait).
+        private const val DETECTION_ROTATION_DEGREES = 270
     }
 
     private var detector: ObjectDetector? = null
-    private var lastSuccessfulRotationIndex = 0
 
     init {
         try {
@@ -94,24 +100,18 @@ class SubjectDetectionAnalyzer(
                 return
             }
 
-            // Try candidate rotations (last winner first) until a car is found.
-            val order = buildList {
-                add(lastSuccessfulRotationIndex)
-                for (i in ROTATION_CANDIDATES.indices) if (i != lastSuccessfulRotationIndex) add(i)
+            // Held in landscape-left, an upright car appears rotated 90° in the
+            // portrait display frame. Rotate to upright for the model (single
+            // fixed rotation — no search), then map the box back to the display
+            // frame so all downstream logic stays in display coordinates.
+            val candidate = if (DETECTION_ROTATION_DEGREES % 360 == 0) {
+                displayBitmap
+            } else {
+                rotateBitmap(displayBitmap, DETECTION_ROTATION_DEGREES)
             }
-
-            var displayDetection: NormalizedDetection? = null
-            for (idx in order) {
-                val degrees = ROTATION_CANDIDATES[idx]
-                val candidate = if (degrees == 0) displayBitmap else rotateBitmap(displayBitmap, degrees)
-                val found = detectLargestCar(activeDetector, candidate)
-                if (found != null) {
-                    // Map the box from the rotated frame back to the display frame.
-                    val displayRect = unrotateNormalizedRect(found.rect, degrees)
-                    displayDetection = found.copy(rect = displayRect)
-                    lastSuccessfulRotationIndex = idx
-                    break
-                }
+            val found = detectLargestCar(activeDetector, candidate)
+            val displayDetection = found?.let {
+                it.copy(rect = unrotateNormalizedRect(it.rect, DETECTION_ROTATION_DEGREES))
             }
 
             val results = if (displayDetection == null) {
@@ -170,7 +170,7 @@ class SubjectDetectionAnalyzer(
      * rotated clockwise by [degrees], back into the display frame's coordinates.
      */
     private fun unrotateNormalizedRect(r: RectF, degrees: Int): RectF {
-        return when (degrees) {
+        return when (degrees % 360) {
             90 -> RectF(r.top, 1f - r.right, r.bottom, 1f - r.left)
             180 -> RectF(1f - r.right, 1f - r.bottom, 1f - r.left, 1f - r.top)
             270 -> RectF(1f - r.bottom, r.left, 1f - r.top, r.right)

@@ -66,6 +66,12 @@ class NativeCameraView extends StatefulWidget {
   /// [GroundGuideEdge.bottom].
   final GroundGuideEdge groundGuideEdge;
 
+  /// How far the ground guide laps into the car box, as a fraction of the box's
+  /// size along the ground axis. The band fades out as it approaches the car
+  /// and the car itself is punched out, so this controls how far the ground
+  /// "wraps" up around the car's ground-side corners. Defaults to 0.15 (15%).
+  final double groundGuideOverlap;
+
   const NativeCameraView({
     super.key,
     required this.onControllerCreated,
@@ -86,6 +92,7 @@ class NativeCameraView extends StatefulWidget {
     this.showGroundGuide = false,
     this.groundGuideMinFraction = 0.15,
     this.groundGuideEdge = GroundGuideEdge.bottom,
+    this.groundGuideOverlap = 0.15,
   });
 
   @override
@@ -161,6 +168,7 @@ class _NativeCameraViewState extends State<NativeCameraView> {
                     showGroundGuide: widget.showGroundGuide,
                     groundMinFraction: widget.groundGuideMinFraction,
                     groundEdge: widget.groundGuideEdge,
+                    groundOverlap: widget.groundGuideOverlap,
                   ),
                 );
               },
@@ -202,6 +210,7 @@ class _NativeCameraViewState extends State<NativeCameraView> {
       'showGroundGuide': widget.showGroundGuide,
       'groundGuideMinFraction': widget.groundGuideMinFraction,
       'groundGuideEdge': widget.groundGuideEdge.name,
+      'groundGuideOverlap': widget.groundGuideOverlap,
     };
 
     final key = ValueKey("native_camera_platform_view_${creationParams['isFrontCamera']}");

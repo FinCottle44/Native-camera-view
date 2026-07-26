@@ -146,6 +146,11 @@ class BoundingBoxPainter extends CustomPainter {
   /// Which edge the ground guide extends from.
   final GroundGuideEdge groundEdge;
 
+  /// How far the ground guide laps into the box, as a fraction of the box's
+  /// size along the ground axis. The car region is punched out and the band
+  /// fades to transparent as it meets the car.
+  final double groundOverlap;
+
   BoundingBoxPainter({
     required this.frame,
     required this.fit,
@@ -158,6 +163,7 @@ class BoundingBoxPainter extends CustomPainter {
     this.showGroundGuide = false,
     this.groundMinFraction = 0.15,
     this.groundEdge = GroundGuideEdge.bottom,
+    this.groundOverlap = 0.15,
   });
 
   @override
@@ -183,34 +189,106 @@ class BoundingBoxPainter extends CustomPainter {
       // Drawn first so the box sits on top. Purple when there's enough ground
       // beyond the car, red when not.
       if (showGroundGuide) {
-        final (Rect band, double gap, double dim) = switch (groundEdge) {
+        // The strip runs from the ground-side phone edge to `groundOverlap`
+        // past the car's near edge (lapping into the box). `gap` is the actual
+        // clearance (phone edge -> car near edge) used for the enough-ground
+        // check; `dim` is the full dimension. The gradient runs opaque at the
+        // phone edge -> transparent as it meets the car (no harsh cutoff), and
+        // the car region is punched out so the band never covers the car.
+        final (Rect strip, double gap, double dim, Alignment gBegin, Alignment gEnd) =
+            switch (groundEdge) {
           GroundGuideEdge.bottom => (
-              Rect.fromLTRB(0, rect.bottom.clamp(0.0, size.height), size.width, size.height),
+              Rect.fromLTRB(
+                0,
+                (rect.bottom - groundOverlap * rect.height).clamp(0.0, size.height),
+                size.width,
+                size.height,
+              ),
               size.height - rect.bottom,
               size.height,
+              Alignment.bottomCenter,
+              Alignment.topCenter,
             ),
           GroundGuideEdge.top => (
-              Rect.fromLTRB(0, 0, size.width, rect.top.clamp(0.0, size.height)),
+              Rect.fromLTRB(
+                0,
+                0,
+                size.width,
+                (rect.top + groundOverlap * rect.height).clamp(0.0, size.height),
+              ),
               rect.top,
               size.height,
+              Alignment.topCenter,
+              Alignment.bottomCenter,
             ),
           GroundGuideEdge.left => (
-              Rect.fromLTRB(0, 0, rect.left.clamp(0.0, size.width), size.height),
+              Rect.fromLTRB(
+                0,
+                0,
+                (rect.left + groundOverlap * rect.width).clamp(0.0, size.width),
+                size.height,
+              ),
               rect.left,
               size.width,
+              Alignment.centerLeft,
+              Alignment.centerRight,
             ),
           GroundGuideEdge.right => (
-              Rect.fromLTRB(rect.right.clamp(0.0, size.width), 0, size.width, size.height),
+              Rect.fromLTRB(
+                (rect.right - groundOverlap * rect.width).clamp(0.0, size.width),
+                0,
+                size.width,
+                size.height,
+              ),
               size.width - rect.right,
               size.width,
+              Alignment.centerRight,
+              Alignment.centerLeft,
             ),
         };
-        if (dim > 0 && band.width > 0 && band.height > 0) {
+        if (dim > 0 && strip.width > 0 && strip.height > 0) {
           final bool enough = (gap / dim) >= groundMinFraction;
+          final Color base = enough ? color : croppedColor;
           final Paint fill = Paint()
             ..style = PaintingStyle.fill
-            ..color = (enough ? color : croppedColor).withValues(alpha: 0.30);
-          canvas.drawRect(band, fill);
+            ..shader = LinearGradient(
+              begin: gBegin,
+              end: gEnd,
+              colors: [
+                base.withValues(alpha: 0.30),
+                base.withValues(alpha: 0.30),
+                base.withValues(alpha: 0.0),
+              ],
+              stops: const [0.0, 0.7, 1.0],
+            ).createShader(strip);
+          // Punch the car out of the strip (difference) so the ground laps up
+          // the sides of the box but never paints over the car itself. Round the
+          // hole's corners that sit on the car's ground-side edge to match the
+          // box's rounded corners (radius 8 below); the inner cut stays square.
+          final Rect hole = strip.intersect(rect);
+          if (hole.width > 0 && hole.height > 0) {
+            final double r =
+                math.min(8.0, math.min(hole.width, hole.height) / 2);
+            final Radius rad = Radius.circular(r);
+            final RRect holeRRect = switch (groundEdge) {
+              GroundGuideEdge.top =>
+                RRect.fromRectAndCorners(hole, topLeft: rad, topRight: rad),
+              GroundGuideEdge.bottom => RRect.fromRectAndCorners(hole,
+                  bottomLeft: rad, bottomRight: rad),
+              GroundGuideEdge.left =>
+                RRect.fromRectAndCorners(hole, topLeft: rad, bottomLeft: rad),
+              GroundGuideEdge.right =>
+                RRect.fromRectAndCorners(hole, topRight: rad, bottomRight: rad),
+            };
+            final Path region = Path.combine(
+              PathOperation.difference,
+              Path()..addRect(strip),
+              Path()..addRRect(holeRRect),
+            );
+            canvas.drawPath(region, fill);
+          } else {
+            canvas.drawRect(strip, fill);
+          }
         }
       }
 
@@ -274,6 +352,7 @@ class BoundingBoxPainter extends CustomPainter {
         oldDelegate.showBox != showBox ||
         oldDelegate.showGroundGuide != showGroundGuide ||
         oldDelegate.groundMinFraction != groundMinFraction ||
-        oldDelegate.groundEdge != groundEdge;
+        oldDelegate.groundEdge != groundEdge ||
+        oldDelegate.groundOverlap != groundOverlap;
   }
 }
