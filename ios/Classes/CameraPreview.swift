@@ -9,6 +9,11 @@ import MediaPipeTasksVision
 class CameraHostView: UIView {
     var previewLayer: AVCaptureVideoPreviewLayer?
 
+    /// How long the box + ground guide take to fade out when the car leaves the
+    /// frame (set from the `detectionFadeMillis` creation param). They still snap
+    /// in immediately when a car is (re)acquired.
+    var fadeOutDuration: CFTimeInterval = 0.2
+
     // Translucent "ground guide" fill, drawn below the box. A gradient (opaque
     // at the ground-side edge, fading to transparent as it meets the car) is
     // masked to a shape: the ground strip with the car region punched out
@@ -55,9 +60,21 @@ class CameraHostView: UIView {
     /// Must be called on the main thread.
     func updateGroundGuide(maskPath: CGPath?, color: UIColor, startPoint: CGPoint, endPoint: CGPoint) {
         guard let p = maskPath else {
+            // Nothing shown, or already fading/faded out — nothing to do.
+            if groundGuideMask.path == nil || groundGuideGradient.opacity == 0 { return }
+            // Quick fade-out instead of an abrupt cut; clear the mask once hidden
+            // so the next appearance snaps in cleanly.
             CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            groundGuideMask.path = nil
+            CATransaction.setAnimationDuration(fadeOutDuration)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+            CATransaction.setCompletionBlock { [weak self] in
+                guard let self = self, self.groundGuideGradient.opacity == 0 else { return }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                self.groundGuideMask.path = nil
+                CATransaction.commit()
+            }
+            groundGuideGradient.opacity = 0
             CATransaction.commit()
             return
         }
@@ -70,6 +87,11 @@ class CameraHostView: UIView {
         } else {
             CATransaction.setAnimationDuration(0.12)
             CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+        }
+        // Cancel any in-flight fade-out and ensure the guide is fully visible.
+        if groundGuideGradient.opacity != 1 {
+            groundGuideGradient.removeAnimation(forKey: "opacity")
+            groundGuideGradient.opacity = 1
         }
         groundGuideMask.path = p
         // Solid for the first stretch, then fade to transparent as it meets the
@@ -87,9 +109,21 @@ class CameraHostView: UIView {
     /// Must be called on the main thread.
     func updateDetectionBox(rect: CGRect?, color: UIColor) {
         guard let r = rect else {
+            // Nothing shown, or already fading/faded out — nothing to do.
+            if detectionBoxLayer.path == nil || detectionBoxLayer.opacity == 0 { return }
+            // Quick fade-out instead of an abrupt cut; clear the path once hidden
+            // so the next appearance snaps in cleanly.
             CATransaction.begin()
-            CATransaction.setDisableActions(true) // clear instantly
-            detectionBoxLayer.path = nil
+            CATransaction.setAnimationDuration(fadeOutDuration)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+            CATransaction.setCompletionBlock { [weak self] in
+                guard let self = self, self.detectionBoxLayer.opacity == 0 else { return }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                self.detectionBoxLayer.path = nil
+                CATransaction.commit()
+            }
+            detectionBoxLayer.opacity = 0
             CATransaction.commit()
             return
         }
@@ -102,6 +136,11 @@ class CameraHostView: UIView {
         } else {
             CATransaction.setAnimationDuration(0.12)
             CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+        }
+        // Cancel any in-flight fade-out and ensure the box is fully visible.
+        if detectionBoxLayer.opacity != 1 {
+            detectionBoxLayer.removeAnimation(forKey: "opacity")
+            detectionBoxLayer.opacity = 1
         }
         detectionBoxLayer.path = newPath
         detectionBoxLayer.strokeColor = color.cgColor
@@ -251,6 +290,9 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             }
             if let overlap = params["groundGuideOverlap"] as? Double {
                 self.groundGuideOverlap = CGFloat(overlap)
+            }
+            if let fadeMs = params["detectionFadeMillis"] as? Int {
+                self._hostView.fadeOutDuration = CFTimeInterval(fadeMs) / 1000.0
             }
         }
         
@@ -1098,6 +1140,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             var payload = basePayload
             payload["isDetected"] = isDetected
             payload["isCropped"] = state.cropped
+            payload["croppedSides"] = state.croppedSides
             payload["hasEnoughGround"] = state.hasEnoughGround
             self.detectionEventSink?(payload)
         }
@@ -1107,20 +1150,25 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     /// layer's own coordinate conversion (handles the aspect-fill crop), and
     /// returns the framing state. Main thread only.
     /// - `cropped`: the car touches a preview edge.
+    /// - `croppedSides`: which edges it touches, in the fixed display (portrait)
+    ///   frame — "left"/"right" are the frame's short edges, "top"/"bottom" its
+    ///   long-side edges, regardless of how the phone is held (see CropSide in Dart).
     /// - `hasEnoughGround`: enough ground beneath the car (true when no car).
-    private func updateNativeOverlays(metadataRect: CGRect?) -> (cropped: Bool, hasEnoughGround: Bool) {
+    private func updateNativeOverlays(metadataRect: CGRect?) -> (cropped: Bool, croppedSides: [String], hasEnoughGround: Bool) {
         guard let previewLayer = _hostView.previewLayer, let mRect = metadataRect else {
             _hostView.updateDetectionBox(rect: nil, color: .clear)
             _hostView.updateGroundGuide(maskPath: nil, color: .clear, startPoint: .zero, endPoint: .zero)
-            return (false, true)
+            return (false, [], true)
         }
         let layerRect = previewLayer.layerRectConverted(fromMetadataOutputRect: mRect)
         let b = previewLayer.bounds
         let margin = min(b.width, b.height) * 0.02
-        let cropped = layerRect.minX <= b.minX + margin
-            || layerRect.minY <= b.minY + margin
-            || layerRect.maxX >= b.maxX - margin
-            || layerRect.maxY >= b.maxY - margin
+        var sides: [String] = []
+        if layerRect.minX <= b.minX + margin { sides.append("left") }
+        if layerRect.minY <= b.minY + margin { sides.append("top") }
+        if layerRect.maxX >= b.maxX - margin { sides.append("right") }
+        if layerRect.maxY >= b.maxY - margin { sides.append("bottom") }
+        let cropped = !sides.isEmpty
         let purple = UIColor(red: 0x6E / 255.0, green: 0x23 / 255.0, blue: 0xFE / 255.0, alpha: 1.0)
         let red = UIColor(red: 1.0, green: 0x3B / 255.0, blue: 0x30 / 255.0, alpha: 1.0)
 
@@ -1206,7 +1254,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             _hostView.updateGroundGuide(maskPath: nil, color: .clear, startPoint: .zero, endPoint: .zero)
         }
 
-        return (cropped, hasEnoughGround)
+        return (cropped, sides, hasEnoughGround)
     }
 
     // MARK: - FlutterStreamHandler (detection EventChannel)

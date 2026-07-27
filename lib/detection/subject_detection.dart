@@ -21,6 +21,21 @@ import 'dart:ui' show Rect;
 
 import 'package:flutter/foundation.dart';
 
+/// An edge of the frame that a detected car is cropped against.
+///
+/// **Orientation (important):** these sides are in the frame's DISPLAY
+/// orientation — the app's fixed/natural (portrait) orientation — NOT the way
+/// the scene looks to a user holding the phone rotated. Because all detection
+/// coordinates are already rotated into the display frame natively, [left] /
+/// [right] are the portrait frame's short (vertical) edges and [top] / [bottom]
+/// are its long-side (horizontal) edges, regardless of how the phone is held.
+///
+/// For this app (orientation-locked, held in landscape-left to shoot a car),
+/// that means the frame's [top]/[bottom] map to the physical long sides of the
+/// phone and [left]/[right] map to the physical short (top/bottom) edges. Report
+/// hints against these fixed sides so they stay stable no matter the holding.
+enum CropSide { left, top, right, bottom }
+
 /// A single detected subject/foreground object for one analyzed frame.
 @immutable
 class SubjectDetection {

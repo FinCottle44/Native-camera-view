@@ -72,6 +72,11 @@ class NativeCameraView extends StatefulWidget {
   /// "wraps" up around the car's ground-side corners. Defaults to 0.15 (15%).
   final double groundGuideOverlap;
 
+  /// How long the detection overlay (box + ground guide) takes to fade out when
+  /// the car leaves the frame, instead of vanishing abruptly. The overlay still
+  /// snaps in immediately when a car is (re)acquired. Defaults to 200ms.
+  final Duration detectionFadeDuration;
+
   const NativeCameraView({
     super.key,
     required this.onControllerCreated,
@@ -93,6 +98,7 @@ class NativeCameraView extends StatefulWidget {
     this.groundGuideMinFraction = 0.15,
     this.groundGuideEdge = GroundGuideEdge.bottom,
     this.groundGuideOverlap = 0.15,
+    this.detectionFadeDuration = const Duration(milliseconds: 200),
   });
 
   @override
@@ -152,26 +158,19 @@ class _NativeCameraViewState extends State<NativeCameraView> {
             widget.enableDetection &&
             (widget.showDetectionBox || widget.showGroundGuide))
           Positioned.fill(
-            child: ValueListenableBuilder<DetectionFrame>(
-              valueListenable: _controller!.detections,
-              builder: (context, frame, _) {
-                return CustomPaint(
-                  painter: BoundingBoxPainter(
-                    frame: frame,
-                    fit: widget.cameraPreviewFit ?? CameraPreviewFit.cover,
-                    color: widget.detectionBoxColor,
-                    croppedColor: widget.croppedBoxColor,
-                    edgeMargin: widget.croppedEdgeMargin,
-                    strokeWidth: widget.detectionBoxStrokeWidth,
-                    showLabel: false,
-                    showBox: widget.showDetectionBox,
-                    showGroundGuide: widget.showGroundGuide,
-                    groundMinFraction: widget.groundGuideMinFraction,
-                    groundEdge: widget.groundGuideEdge,
-                    groundOverlap: widget.groundGuideOverlap,
-                  ),
-                );
-              },
+            child: _DetectionOverlay(
+              controller: _controller!,
+              fit: widget.cameraPreviewFit ?? CameraPreviewFit.cover,
+              color: widget.detectionBoxColor,
+              croppedColor: widget.croppedBoxColor,
+              edgeMargin: widget.croppedEdgeMargin,
+              strokeWidth: widget.detectionBoxStrokeWidth,
+              showBox: widget.showDetectionBox,
+              showGroundGuide: widget.showGroundGuide,
+              groundMinFraction: widget.groundGuideMinFraction,
+              groundEdge: widget.groundGuideEdge,
+              groundOverlap: widget.groundGuideOverlap,
+              fadeDuration: widget.detectionFadeDuration,
             ),
           ),
 
@@ -211,6 +210,7 @@ class _NativeCameraViewState extends State<NativeCameraView> {
       'groundGuideMinFraction': widget.groundGuideMinFraction,
       'groundGuideEdge': widget.groundGuideEdge.name,
       'groundGuideOverlap': widget.groundGuideOverlap,
+      'detectionFadeMillis': widget.detectionFadeDuration.inMilliseconds,
     };
 
     final key = ValueKey("native_camera_platform_view_${creationParams['isFrontCamera']}");
@@ -234,5 +234,127 @@ class _NativeCameraViewState extends State<NativeCameraView> {
     }
 
     return const Center(child: Text("Platform not supported."));
+  }
+}
+
+/// Android detection overlay (box + ground guide) with a quick fade-out.
+///
+/// The native [BoundingBoxPainter] draws nothing for an empty frame, so a lost
+/// car would otherwise vanish abruptly. This widget retains the last frame that
+/// had a detection and fades a [FadeTransition] out over [fadeDuration] when the
+/// car leaves, then snaps back to full opacity the instant a car is reacquired.
+///
+/// (iOS draws the overlay natively and fades there; this is the Android path.)
+class _DetectionOverlay extends StatefulWidget {
+  const _DetectionOverlay({
+    required this.controller,
+    required this.fit,
+    required this.color,
+    required this.croppedColor,
+    required this.edgeMargin,
+    required this.strokeWidth,
+    required this.showBox,
+    required this.showGroundGuide,
+    required this.groundMinFraction,
+    required this.groundEdge,
+    required this.groundOverlap,
+    required this.fadeDuration,
+  });
+
+  final CameraController controller;
+  final CameraPreviewFit fit;
+  final Color color;
+  final Color croppedColor;
+  final double edgeMargin;
+  final double strokeWidth;
+  final bool showBox;
+  final bool showGroundGuide;
+  final double groundMinFraction;
+  final GroundGuideEdge groundEdge;
+  final double groundOverlap;
+  final Duration fadeDuration;
+
+  @override
+  State<_DetectionOverlay> createState() => _DetectionOverlayState();
+}
+
+class _DetectionOverlayState extends State<_DetectionOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _fade = AnimationController(
+    vsync: this,
+    duration: widget.fadeDuration,
+    value: 0.0,
+  );
+
+  /// The most recent frame that contained a detection. Kept while fading out so
+  /// the box/ground guide stay painted (dimming) rather than disappearing.
+  DetectionFrame _lastNonEmpty = DetectionFrame.empty;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.detections.addListener(_onDetections);
+    // Seed directly (no setState during initState) in case a car is already
+    // detected when the overlay mounts.
+    final frame = widget.controller.detections.value;
+    if (frame.detections.isNotEmpty) {
+      _lastNonEmpty = frame;
+      _fade.value = 1.0;
+    }
+  }
+
+  void _onDetections() {
+    final frame = widget.controller.detections.value;
+    if (frame.detections.isNotEmpty) {
+      // Car present: repaint at the new position and make sure we're visible,
+      // cancelling any in-flight fade-out (snap in).
+      _lastNonEmpty = frame;
+      if (_fade.value != 1.0) _fade.value = 1.0;
+      if (mounted) setState(() {});
+    } else if (_fade.value > 0.0 && !_fade.isAnimating) {
+      // Car lost: fade the retained box out. The FadeTransition drives the
+      // repaint as it dims, so no setState is needed here.
+      _fade.reverse(from: _fade.value);
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _DetectionOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.controller, widget.controller)) {
+      oldWidget.controller.detections.removeListener(_onDetections);
+      widget.controller.detections.addListener(_onDetections);
+    }
+    _fade.duration = widget.fadeDuration;
+  }
+
+  @override
+  void dispose() {
+    widget.controller.detections.removeListener(_onDetections);
+    _fade.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _fade,
+      child: CustomPaint(
+        painter: BoundingBoxPainter(
+          frame: _lastNonEmpty,
+          fit: widget.fit,
+          color: widget.color,
+          croppedColor: widget.croppedColor,
+          edgeMargin: widget.edgeMargin,
+          strokeWidth: widget.strokeWidth,
+          showLabel: false,
+          showBox: widget.showBox,
+          showGroundGuide: widget.showGroundGuide,
+          groundMinFraction: widget.groundMinFraction,
+          groundEdge: widget.groundEdge,
+          groundOverlap: widget.groundOverlap,
+        ),
+      ),
+    );
   }
 }

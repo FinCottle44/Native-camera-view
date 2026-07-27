@@ -27,6 +27,11 @@ Key properties:
   temporally smoothed (EMA + a short hold on missed frames) so it tracks smoothly
   instead of flickering. On iOS the smoothing is native; on Android it runs in
   the Dart controller.
+- **Graceful fade-out.** When the car finally leaves the frame, the overlay (box
+  + ground guide) fades out over `detectionFadeDuration` (default 200ms) instead
+  of vanishing abruptly, and snaps back to full opacity the instant a car is
+  reacquired. iOS fades the native layers' opacity; Android fades the Dart
+  overlay while holding the last box.
 - **Single-orientation detection (configurable).** The consuming app runs
   landscape-left only, where the car is found on the un-rotated frame, so
   detection runs a single pass (`.up`) — no orientation sensing, no wasted
@@ -110,6 +115,9 @@ All the on-screen helpers are toggleable at widget instantiation:
 - `detectionBoxStrokeWidth` — overlay stroke width.
 - `detectionSmoothing` — 0.0..1.0 EMA factor (default 0.4; higher = snappier,
   0.0 disables smoothing).
+- `detectionFadeDuration` — how long the overlay (box + ground guide) takes to
+  fade out when the car leaves the frame (default 200ms). It still snaps in
+  immediately on (re)acquisition. Applies to both platforms.
 - Native score threshold: `SCORE_THRESHOLD` in `SubjectDetectionAnalyzer.kt` and
   `detectionMinConfidence` in `CameraPreview.swift`.
 
@@ -160,6 +168,12 @@ Each event is a map:
 - `isMirrored = true` means the coordinates are in a non-mirrored space while the
   preview is mirrored (Android front camera). Consumers flip X
   (`left' = 1 - right`) before mapping. iOS mirrors natively and reports `false`.
+
+Alongside `detections`, each event carries the natively-computed framing state
+(see §5.1): `isDetected` (bool), `isCropped` (bool), `croppedSides` (list of
+`"left"`/`"top"`/`"right"`/`"bottom"` — edges of the display/portrait frame), and
+`hasEnoughGround` (bool). `croppedSides` is non-empty exactly when `isCropped` is
+true.
 
 ### Dart types
 
@@ -241,29 +255,42 @@ ValueListenableBuilder<DetectionFrame>(
 
 ### 5.1 Framing state — DONE
 
-The controller exposes three `ValueNotifier<bool>`s so apps can drive framing
-warnings:
+The controller exposes framing signals so apps can drive warnings:
 
-- `controller.isCarDetected` — a car is currently in view.
-- `controller.isCarCropped` — the detected car touches a frame edge (likely cut
-  off). Always false when no car is detected.
-- `controller.hasEnoughGround` — enough ground/foreground beneath the car (per
-  `groundGuideMinFraction`). True when no car is detected, so gate a hint on
-  `isCarDetected && !hasEnoughGround`.
+- `controller.isCarDetected` (`ValueNotifier<bool>`) — a car is currently in view.
+- `controller.isCarCropped` (`ValueNotifier<bool>`) — the detected car touches a
+  frame edge (likely cut off). Always false when no car is detected.
+- `controller.croppedSides` (`ValueNotifier<Set<CropSide>>`) — *which* edge(s)
+  the car is cropped against, for directional hints. Empty unless `isCarCropped`
+  is true (they always agree). **Sides are in the fixed/natural (portrait)
+  display orientation, not how the user sees the scene**: `CropSide.left`/`right`
+  are the portrait frame's short edges and `top`/`bottom` its long-side edges,
+  regardless of how the phone is held. See `CropSide` for the full contract.
+- `controller.hasEnoughGround` (`ValueNotifier<bool>`) — enough ground/foreground
+  beneath the car (per `groundGuideMinFraction`). True when no car is detected,
+  so gate a hint on `isCarDetected && !hasEnoughGround`.
 
 All are computed **natively against the visible preview** (iOS: box vs preview
 layer bounds; Android: vs `PreviewView` with `FILL_CENTER`) and sent in the
-detection payload (`isDetected` / `isCropped` / `hasEnoughGround`), so they match
-exactly what the user sees. Advisory only — they never block capture.
+detection payload (`isDetected` / `isCropped` / `croppedSides` / `hasEnoughGround`),
+so they match exactly what the user sees. Advisory only — they never block capture.
 
 ```dart
 AnimatedBuilder(
   animation: Listenable.merge([
-    controller.isCarDetected, controller.isCarCropped, controller.hasEnoughGround,
+    controller.isCarDetected, controller.croppedSides, controller.hasEnoughGround,
   ]),
   builder: (context, _) {
     if (!controller.isCarDetected.value) return const SizedBox.shrink();
-    if (controller.isCarCropped.value) return const Text('Move back to fit the whole car');
+    final sides = controller.croppedSides.value;
+    if (sides.isNotEmpty) {
+      // Portrait-frame sides. Held in landscape-left, the frame's short edges
+      // (left/right) are what the user perceives as up/down, so map them to
+      // your own on-screen arrows if you want screen-relative hints.
+      if (sides.contains(CropSide.left)) return const Text("Car's cut off — pan toward the frame's left");
+      if (sides.contains(CropSide.right)) return const Text("Car's cut off — pan toward the frame's right");
+      return const Text('Move back to fit the whole car');
+    }
     if (!controller.hasEnoughGround.value) return const Text('Leave more ground below the car');
     return const SizedBox.shrink();
   },

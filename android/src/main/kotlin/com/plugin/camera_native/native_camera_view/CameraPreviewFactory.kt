@@ -426,11 +426,12 @@ class CameraPlatformView(
                 val isFront = currentLensFacing == CameraSelector.LENS_FACING_FRONT
                 mainHandler.post {
                     // Compute the cropped state against the actual preview bounds
-                    // (FILL_CENTER cover), matching what the user sees.
-                    val isCropped = if (detections.isEmpty()) {
-                        false
+                    // (FILL_CENTER cover), matching what the user sees. Sides are
+                    // in the fixed portrait display frame (see CropSide in Dart).
+                    val sides = if (detections.isEmpty()) {
+                        emptyList()
                     } else {
-                        isSubjectCropped(detections[0], imageWidth, imageHeight, isFront)
+                        croppedSides(detections[0], imageWidth, imageHeight, isFront)
                     }
                     val hasEnoughGround = if (detections.isEmpty()) {
                         true
@@ -445,7 +446,8 @@ class CameraPlatformView(
                         "isMirrored" to isFront,
                         "detections" to detections,
                         "isDetected" to detections.isNotEmpty(),
-                        "isCropped" to isCropped,
+                        "isCropped" to sides.isNotEmpty(),
+                        "croppedSides" to sides,
                         "hasEnoughGround" to hasEnoughGround
                     )
                     detectionEventSink?.success(payload)
@@ -586,22 +588,28 @@ class CameraPlatformView(
         return dim > 0f && (gap / dim) >= groundGuideMinFraction
     }
 
-    private fun isSubjectCropped(
+    // Which visible preview edges the detected car touches (cropped), computed
+    // against the PreviewView with FILL_CENTER (cover) — matching what the user
+    // sees. Sides are in the fixed portrait display frame: "left"/"right" are
+    // the frame's short edges and "top"/"bottom" its long-side edges, regardless
+    // of how the phone is held (see CropSide in Dart). Assumes cover fit.
+    // Empty list == not cropped.
+    private fun croppedSides(
         box: Map<String, Any>,
         imageWidth: Int,
         imageHeight: Int,
         isFront: Boolean
-    ): Boolean {
+    ): List<String> {
         val vw = previewView.width.toFloat()
         val vh = previewView.height.toFloat()
-        if (vw <= 0f || vh <= 0f || imageWidth <= 0 || imageHeight <= 0) return false
+        if (vw <= 0f || vh <= 0f || imageWidth <= 0 || imageHeight <= 0) return emptyList()
 
-        var l = (box["left"] as? Double)?.toFloat() ?: return false
-        val t = (box["top"] as? Double)?.toFloat() ?: return false
-        var r = (box["right"] as? Double)?.toFloat() ?: return false
-        val b = (box["bottom"] as? Double)?.toFloat() ?: return false
+        var l = (box["left"] as? Double)?.toFloat() ?: return emptyList()
+        val t = (box["top"] as? Double)?.toFloat() ?: return emptyList()
+        var r = (box["right"] as? Double)?.toFloat() ?: return emptyList()
+        val b = (box["bottom"] as? Double)?.toFloat() ?: return emptyList()
 
-        // Front preview is mirrored; flip X to match.
+        // Front preview is mirrored; flip X so left/right match what's shown.
         if (isFront) {
             val nl = 1f - r
             val nr = 1f - l
@@ -623,7 +631,12 @@ class CameraPlatformView(
         val bottom = b * dispH + offY
 
         val margin = minOf(vw, vh) * 0.02f
-        return left <= margin || top <= margin || right >= vw - margin || bottom >= vh - margin
+        val sides = mutableListOf<String>()
+        if (left <= margin) sides.add("left")
+        if (top <= margin) sides.add("top")
+        if (right >= vw - margin) sides.add("right")
+        if (bottom >= vh - margin) sides.add("bottom")
+        return sides
     }
 
     private fun setDetectionEnabledNative(enabled: Boolean, result: MethodChannel.Result) {

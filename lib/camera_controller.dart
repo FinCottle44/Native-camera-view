@@ -44,6 +44,17 @@ class CameraController {
   /// blocks capture.
   final ValueNotifier<bool> isCarCropped = ValueNotifier(false);
 
+  /// Which frame edge(s) the detected car is cropped against, for more specific
+  /// hints (e.g. "move right — the car's cut off on the left"). Empty when the
+  /// car is fully in frame or no car is detected; non-empty exactly when
+  /// [isCarCropped] is true.
+  ///
+  /// Sides are in the fixed/natural (portrait) display orientation, not how the
+  /// scene looks to the user — see [CropSide]. Computed natively against the
+  /// visible preview, so they agree with what's shown. Advisory only.
+  final ValueNotifier<Set<CropSide>> croppedSides =
+      ValueNotifier(const <CropSide>{});
+
   /// Whether there's enough ground/foreground beneath the detected car (per the
   /// view's `groundGuideMinFraction`). True when no car is detected, so drive a
   /// hint from `isCarDetected && !hasEnoughGround`. Advisory only.
@@ -83,6 +94,7 @@ class CameraController {
         isCarDetected.value =
             event['isDetected'] as bool? ?? frame.detections.isNotEmpty;
         isCarCropped.value = event['isCropped'] as bool? ?? false;
+        croppedSides.value = _parseCroppedSides(event['croppedSides']);
         hasEnoughGround.value = event['hasEnoughGround'] as bool? ?? true;
       },
       onError: (Object error) {
@@ -151,6 +163,30 @@ class CameraController {
 
   static double _lerp(double a, double b, double t) => a + (b - a) * t;
 
+  /// Parses the native `croppedSides` payload (a list of edge names) into a
+  /// [CropSide] set. Unknown/missing values are ignored.
+  static Set<CropSide> _parseCroppedSides(Object? raw) {
+    if (raw is! List || raw.isEmpty) return const <CropSide>{};
+    final sides = <CropSide>{};
+    for (final s in raw) {
+      switch (s) {
+        case 'left':
+          sides.add(CropSide.left);
+          break;
+        case 'top':
+          sides.add(CropSide.top);
+          break;
+        case 'right':
+          sides.add(CropSide.right);
+          break;
+        case 'bottom':
+          sides.add(CropSide.bottom);
+          break;
+      }
+    }
+    return sides;
+  }
+
   /// Turns live subject detection on or off at runtime. The view must have been
   /// created with `enableDetection: true` for the native analyzer to be wired.
   Future<void> setDetectionEnabled(bool enabled) async {
@@ -163,6 +199,7 @@ class CameraController {
         detections.value = DetectionFrame.empty;
         isCarDetected.value = false;
         isCarCropped.value = false;
+        croppedSides.value = const <CropSide>{};
         hasEnoughGround.value = true;
       }
     } on PlatformException catch (e) {
@@ -309,6 +346,7 @@ class CameraController {
     detections.dispose();
     isCarDetected.dispose();
     isCarCropped.dispose();
+    croppedSides.dispose();
     hasEnoughGround.dispose();
     _channel.setMethodCallHandler(null);
   }
