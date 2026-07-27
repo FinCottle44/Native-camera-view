@@ -555,6 +555,27 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         case "setDetectionEnabled":
             let enabled = (call.arguments as? Bool) ?? false
             self.detectionEnabled = enabled
+            if !enabled {
+                // Stopping inference doesn't erase what's already on screen: the
+                // last box and ground guide stay painted until something draws
+                // over them, which never comes. Clear them and drop the smoothing
+                // state so a later re-enable starts fresh rather than gliding out
+                // of a stale box.
+                //
+                // Routed through the frame queue first so it lands after any
+                // inference still in flight - that one has already queued its own
+                // main-thread draw, and clearing before it would just get painted
+                // over again.
+                videoDataOutputQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    self.smoothedBox = nil
+                    self.detectionMissCount = 0
+                    DispatchQueue.main.async {
+                        guard !self.isDeinitializing else { return }
+                        _ = self.updateNativeOverlays(metadataRect: nil)
+                    }
+                }
+            }
             print("[CameraPlatformView-\(viewId)] setDetectionEnabled: \(enabled)")
             result(nil)
 
