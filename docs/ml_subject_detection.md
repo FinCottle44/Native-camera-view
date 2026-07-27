@@ -233,11 +233,19 @@ ValueListenableBuilder<DetectionFrame>(
   at in-between angles (~45°) — CoreMotion would be the lever for rock-solid odd
   angles.
 - **iOS box drawing is native; Android is Dart.** iOS positions the box via the
-  preview layer, so it's exact by construction. Android maps the display-oriented
-  box through the Dart `cover` mapping onto `PreviewView` (`FILL_CENTER`); this
-  matches in the common case but has not been device-verified as thoroughly as
-  iOS. If Android positioning is off, give it the same native treatment (CameraX
-  `CoordinateTransform` over `PreviewView`).
+  preview layer, so it's exact by construction. On Android, Preview + ImageAnalysis
+  (+ ImageCapture) are bound in a `UseCaseGroup` with a shared `ViewPort` taken
+  from the `PreviewView` (FILL_CENTER), and the analyzer crops each frame to the
+  resulting `ImageProxy.cropRect`, so the analyzed field of view matches exactly
+  what the preview shows. The Dart `cover` mapping then lands the box correctly
+  regardless of the app's preview resolution/layout. (Before this, the analyzer
+  ran on the full analysis buffer while the preview showed a different FOV, so
+  boxes rendered consistently smaller and the ground thresholds skewed — visible
+  in apps that sized/configured the preview differently from the example app.)
+- **Android assumes `cover` (FILL_CENTER).** The shared `ViewPort` and the native
+  cropped/ground math are all cover-based. A non-`cover` `cameraPreviewFit` on
+  Android will misalign the overlay and skew the thresholds; use `cover`, or
+  extend the native math + ViewPort fit type to match the chosen fit.
 - **Cropped check (iOS) is preview-frame based.** The red/edge check runs against
   the preview bounds (what the user sees), which is what matters for framing.
 - **Single class.** Only `car` is reported. Trucks/buses/vans are ignored unless

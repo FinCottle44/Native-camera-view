@@ -91,7 +91,14 @@ class SubjectDetectionAnalyzer(
             // it (raw sensor buffer rotated by the analysis rotationDegrees).
             val raw = imageProxy.toBitmap()
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-            val displayBitmap = rotateBitmap(raw, rotationDegrees)
+            // Crop to the use case's crop rect (set by the shared ViewPort in the
+            // factory) so the analyzed frame covers exactly the field of view the
+            // preview shows. toBitmap() returns the FULL buffer — the crop rect is
+            // only metadata — so we apply it here. No-op when the rect already
+            // spans the whole buffer (e.g. no ViewPort configured). cropRect is in
+            // the raw (unrotated) buffer space, so crop before rotating.
+            val visibleBitmap = cropToRect(raw, imageProxy.cropRect)
+            val displayBitmap = rotateBitmap(visibleBitmap, rotationDegrees)
 
             val dispW = displayBitmap.width
             val dispH = displayBitmap.height
@@ -176,6 +183,23 @@ class SubjectDetectionAnalyzer(
             270 -> RectF(1f - r.bottom, r.left, 1f - r.top, r.right)
             else -> RectF(r) // 0
         }
+    }
+
+    /**
+     * Crops [bitmap] to [rect] (in the raw, unrotated buffer's coordinate space).
+     * Returns the input unchanged when the rect already spans the whole buffer or
+     * is unusable, so this is a no-op unless a ViewPort crop rect is in effect.
+     */
+    private fun cropToRect(bitmap: Bitmap, rect: android.graphics.Rect): Bitmap {
+        val left = rect.left.coerceIn(0, bitmap.width)
+        val top = rect.top.coerceIn(0, bitmap.height)
+        val right = rect.right.coerceIn(left, bitmap.width)
+        val bottom = rect.bottom.coerceIn(top, bitmap.height)
+        val w = right - left
+        val h = bottom - top
+        if (w <= 0 || h <= 0) return bitmap
+        if (left == 0 && top == 0 && w == bitmap.width && h == bitmap.height) return bitmap
+        return Bitmap.createBitmap(bitmap, left, top, w, h)
     }
 
     private fun rotateBitmap(bitmap: Bitmap, degrees: Int): Bitmap {

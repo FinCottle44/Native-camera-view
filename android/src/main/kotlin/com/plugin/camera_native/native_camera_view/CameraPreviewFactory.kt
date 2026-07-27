@@ -475,24 +475,27 @@ class CameraPlatformView(
             imageCapture?.let { useCasesToBind.add(it) }
             imageAnalysisUseCase?.let { useCasesToBind.add(it) }
 
-            if(useCasesToBind.isEmpty() && imageCapture == null){
-                Log.w(TAG, "No use cases to bind for viewId $viewId. ImageCapture is null.")
-            } else if (useCasesToBind.isEmpty() && imageCapture != null) {
-                Log.d(TAG, "Binding only ImageCapture for viewId $viewId (camera paused)")
-                this.camera = cameraProvider.bindToLifecycle(
-                    this,
-                    cameraSelector,
-                    imageCapture!!
-                )
-            }
-            else if (useCasesToBind.isNotEmpty()){
-                this.camera = cameraProvider.bindToLifecycle(
-                    this,
-                    cameraSelector,
-                    *useCasesToBind.toTypedArray()
-                )
+            if (useCasesToBind.isEmpty()) {
+                Log.w(TAG, "No use cases to bind for viewId $viewId.")
             } else {
-                Log.w(TAG, "No use cases were actually bound for viewId $viewId")
+                // Bind through a UseCaseGroup with a shared ViewPort so Preview,
+                // ImageAnalysis and ImageCapture map to the SAME sensor region
+                // (WYSIWYG). Without it, CameraX can hand the analyzer a different
+                // resolution/aspect — and thus a different field of view — than the
+                // preview shows, so detection boxes (normalized to the analysis
+                // frame) render consistently smaller/misaligned and the ground
+                // thresholds skew ("zoomed in"). The ViewPort is taken from the
+                // PreviewView (FILL_CENTER = "cover") and the analyzer honours the
+                // resulting crop rect. Falls back to plain binding if the view
+                // isn't laid out yet (viewPort == null).
+                val groupBuilder = UseCaseGroup.Builder()
+                previewView.viewPort?.let { groupBuilder.setViewPort(it) }
+                useCasesToBind.forEach { groupBuilder.addUseCase(it) }
+                this.camera = cameraProvider.bindToLifecycle(
+                    this,
+                    cameraSelector,
+                    groupBuilder.build()
+                )
             }
             Log.d(TAG, "Camera use cases bound for viewId $viewId. Paused: $isCameraPausedManually")
             isCameraInitialized = true
@@ -761,10 +764,23 @@ class CameraPlatformView(
                 Log.e(TAG, "PreviewView dimensions are zero. Cannot calculate crop.")
                 return null
             }
-            val previewAspectRatio = previewWidth / previewHeight
+            val rawPreviewAspectRatio = previewWidth / previewHeight
+            // The captured photo can be 90° transposed from the preview — e.g. it
+            // comes out landscape (orientation-aware capture / ViewPort crop / EXIF)
+            // while the preview is portrait. They then describe the SAME field of
+            // view, just rotated. Compare in the PHOTO's orientation; otherwise we
+            // trim the wrong axis and slice the scene roughly in half, which looks
+            // like a heavy zoom-in. Same-orientation is unchanged (no-op).
+            val photoIsLandscape = photoWidth >= photoHeight
+            val previewIsLandscape = previewWidth >= previewHeight
+            val previewAspectRatio = if (photoIsLandscape == previewIsLandscape) {
+                rawPreviewAspectRatio
+            } else {
+                previewHeight / previewWidth
+            }
 
             Log.d(TAG, "Original Photo: ${photoWidth}x$photoHeight (AR: $photoAspectRatio)")
-            Log.d(TAG, "Preview View: ${previewWidth}x$previewHeight (AR: $previewAspectRatio)")
+            Log.d(TAG, "Preview View: ${previewWidth}x$previewHeight (AR: $rawPreviewAspectRatio, effective: $previewAspectRatio)")
 
             var cropX = 0f
             var cropY = 0f
