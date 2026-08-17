@@ -6,6 +6,24 @@ import 'package:flutter/foundation.dart' show debugPrint, ValueNotifier;
 
 import 'detection/subject_detection.dart';
 
+/// Global toggle for the plugin's verbose diagnostic logging (Dart side).
+///
+/// Every line is tagged `NCVDIAG` so you can filter it in one place, e.g.
+/// `flutter logs | grep NCVDIAG` (the iOS and Android native layers emit the
+/// same tag). Left on by default while chasing the intermittent blank-preview
+/// issue; set to `false` to silence.
+bool nativeCameraViewDiagnostics = true;
+
+/// Emits a single tagged, timestamped diagnostic line. [area] is a short
+/// sub-system label (e.g. `init`, `native`, `watchdog`) to make grepping easier.
+void ncvLog(String area, String message) {
+  if (!nativeCameraViewDiagnostics) return;
+  final ts = DateTime.now().toIso8601String();
+  // debugPrint (not print) so the lines are throttled with the rest of Flutter's
+  // logging and stripped appropriately in release tooling.
+  debugPrint('NCVDIAG $ts [dart/$area] $message');
+}
+
 // Enum to define fit modes for camera preview
 enum CameraPreviewFit {
   fitWidth,
@@ -71,22 +89,62 @@ class CameraController {
   int _missFrames = 0;
   static const int _maxMissFrames = 5;
 
+  // --- Diagnostics (blank-preview watchdog) ---
+  // If the native side never reports `onCameraReady`, the preview area shows
+  // blank. This watchdog logs loudly while that persists so an intermittent
+  // failure leaves a trace.
+  Timer? _readyWatchdog;
+  final Stopwatch _sinceInit = Stopwatch();
+  bool _cameraReadyReceived = false;
+  bool _firstDetectionLogged = false;
+
   CameraController({
     required MethodChannel channel,
     EventChannel? detectionChannel,
     this.detectionSmoothing = 0.4,
   })  : _channel = channel,
         _detectionChannel = detectionChannel {
+    ncvLog('controller',
+        'created (channel=${channel.name}, detection=${detectionChannel != null}, smoothing=$detectionSmoothing)');
     _channel.setMethodCallHandler(_handleNativeMethodCall);
     _subscribeToDetections();
   }
 
+  /// Logs (loudly) while the camera has not reported ready, so an intermittent
+  /// "blank preview" that never recovers leaves a trail. Cancelled as soon as
+  /// `onCameraReady`/`onCameraError` arrives, or on dispose.
+  void _startReadyWatchdog() {
+    _readyWatchdog?.cancel();
+    int elapsed = 0;
+    _readyWatchdog = Timer.periodic(const Duration(seconds: 4), (t) {
+      if (_cameraReadyReceived) {
+        t.cancel();
+        return;
+      }
+      elapsed += 4;
+      ncvLog('watchdog',
+          'camera STILL not ready after ${elapsed}s — isLoading=${isLoading.value}, '
+          'isPaused=${isPaused.value}, error=${errorMessage.value}. The native '
+          'preview likely failed to start/attach (this is the blank-preview case).');
+      if (elapsed >= 20) t.cancel();
+    });
+  }
+
   void _subscribeToDetections() {
     final channel = _detectionChannel;
-    if (channel == null) return;
+    if (channel == null) {
+      ncvLog('detect', 'no detection channel (detection disabled)');
+      return;
+    }
+    ncvLog('detect', 'subscribing to detection event stream');
     _detectionSubscription = channel.receiveBroadcastStream().listen(
       (event) {
         if (event is! Map) return;
+        if (!_firstDetectionLogged) {
+          _firstDetectionLogged = true;
+          ncvLog('detect',
+              'first detection event received (frames are flowing natively)');
+        }
         final frame = DetectionFrame.fromMap(event);
         detections.value =
             detectionSmoothing <= 0 ? frame : _smoothFrame(frame);
@@ -98,8 +156,10 @@ class CameraController {
         hasEnoughGround.value = event['hasEnoughGround'] as bool? ?? true;
       },
       onError: (Object error) {
+        ncvLog('detect', 'stream error: $error');
         debugPrint("CameraController: detection stream error: $error");
       },
+      onDone: () => ncvLog('detect', 'detection stream closed'),
     );
   }
 
@@ -190,6 +250,7 @@ class CameraController {
   /// Turns live subject detection on or off at runtime. The view must have been
   /// created with `enableDetection: true` for the native analyzer to be wired.
   Future<void> setDetectionEnabled(bool enabled) async {
+    ncvLog('detect', 'setDetectionEnabled($enabled)');
     try {
       await _channel.invokeMethod('setDetectionEnabled', enabled);
       if (!enabled) {
@@ -210,20 +271,41 @@ class CameraController {
   Future<void> _handleNativeMethodCall(MethodCall call) async {
     switch (call.method) {
       case 'onCameraReady':
-        if (isLoading.value) isLoading.value = false;
+        _cameraReadyReceived = true;
+        _readyWatchdog?.cancel();
+        ncvLog('native',
+            'onCameraReady (${_sinceInit.isRunning ? '${_sinceInit.elapsedMilliseconds}ms after initialize' : 'no init timing'})');
+        if (isLoading.value) {
+          isLoading.value = false;
+          ncvLog('state', 'isLoading -> false (preview should now be visible)');
+        }
         break;
       case 'onCameraError':
-        if (isLoading.value) isLoading.value = false;
+        _readyWatchdog?.cancel();
         final Map? args = call.arguments as Map?;
-        errorMessage.value = args?['message'] ?? "Unknown camera error";
+        final msg = args?['message'] ?? "Unknown camera error";
+        ncvLog('native',
+            'onCameraError: $msg (${_sinceInit.elapsedMilliseconds}ms after initialize)');
+        if (isLoading.value) isLoading.value = false;
+        errorMessage.value = msg;
         break;
+      default:
+        ncvLog('native', 'unhandled native call: ${call.method}');
     }
   }
 
   Future<void> initialize() async {
+    _cameraReadyReceived = false;
+    _sinceInit
+      ..reset()
+      ..start();
+    _startReadyWatchdog();
+    ncvLog('init', 'sending initialize to native');
     try {
       await _channel.invokeMethod('initialize');
+      ncvLog('init', 'initialize invokeMethod returned (awaiting onCameraReady)');
     } on PlatformException catch (e) {
+      ncvLog('init', 'initialize FAILED: ${e.code} / ${e.message}');
       debugPrint("CameraController: Failed to send initialize command: '${e.message}'.");
     }
   }
@@ -242,33 +324,46 @@ class CameraController {
 
   /// Pauses the camera preview.
   Future<void> pauseCamera() async {
+    ncvLog('lifecycle', 'pauseCamera requested');
     try {
       await _channel.invokeMethod('pauseCamera');
       isPaused.value = true;
-      debugPrint('CameraController: Pause command sent.');
+      ncvLog('lifecycle', 'pauseCamera sent (isPaused -> true)');
     } on PlatformException catch (e) {
+      ncvLog('lifecycle', 'pauseCamera FAILED: ${e.message}');
       debugPrint("CameraController: Error pausing camera: '${e.message}'.");
     }
   }
 
   /// Resumes the camera preview.
   Future<void> resumeCamera() async {
+    ncvLog('lifecycle', 'resumeCamera requested');
+    // A blank preview after resume is a common failure mode, so re-arm the
+    // readiness watchdog: native re-binds and should emit onCameraReady again.
+    _cameraReadyReceived = false;
+    _sinceInit
+      ..reset()
+      ..start();
+    _startReadyWatchdog();
     try {
       await _channel.invokeMethod('resumeCamera');
       isPaused.value = false;
-      debugPrint('CameraController: Resume command sent.');
+      ncvLog('lifecycle', 'resumeCamera sent (isPaused -> false, awaiting re-ready)');
     } on PlatformException catch (e) {
+      ncvLog('lifecycle', 'resumeCamera FAILED: ${e.message}');
       debugPrint("CameraController: Error resuming camera: '${e.message}'.");
     }
   }
 
   /// Switches between front and back cameras.
   Future<void> switchCamera(bool useFrontCamera) async {
+    ncvLog('lifecycle', 'switchCamera requested (useFront=$useFrontCamera)');
     try {
       await _channel.invokeMethod('switchCamera', {'useFrontCamera': useFrontCamera});
-      debugPrint('CameraController: Switch camera (useFront: $useFrontCamera) sent.');
       _isFrontCamera = useFrontCamera;
+      ncvLog('lifecycle', 'switchCamera sent (useFront=$useFrontCamera)');
     } on PlatformException catch (e) {
+      ncvLog('lifecycle', 'switchCamera FAILED: ${e.message}');
       debugPrint("CameraController: Error switching camera: '${e.message}'.");
     }
   }
@@ -338,6 +433,9 @@ class CameraController {
   }
 
   void dispose() {
+    ncvLog('controller', 'dispose');
+    _readyWatchdog?.cancel();
+    _readyWatchdog = null;
     _detectionSubscription?.cancel();
     _detectionSubscription = null;
     isPaused.dispose();

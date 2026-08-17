@@ -85,6 +85,10 @@ class CameraPlatformView(
     private var currentLensFacing: Int = CameraSelector.LENS_FACING_BACK
 
     private val TAG = "CameraPlatformView"
+    // --- Diagnostics (NCVDIAG): trace the preview lifecycle to catch the
+    // intermittent blank-preview issue. Filter logcat by "NCVDIAG".
+    private val diagCreatedAtMs = System.currentTimeMillis()
+    private var cameraReadySent = false
     private val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
     private var currentPreviewFitStr: String = "cover"
 
@@ -104,6 +108,29 @@ class CameraPlatformView(
         private const val REQUEST_CODE_PERMISSIONS = 10
     }
 
+    /** One tagged, elapsed-timestamped diagnostic line. Filter logcat: NCVDIAG. */
+    private fun diag(area: String, message: String) {
+        Log.d("NCVDIAG", "+${System.currentTimeMillis() - diagCreatedAtMs}ms [android view $viewId] [$area] $message")
+    }
+
+    /**
+     * Logs loudly while the camera has not reported ready, so an intermittent
+     * blank preview that never recovers leaves a trail. Cancels itself once
+     * [cameraReadySent] flips true.
+     */
+    private fun scheduleReadyWatchdog() {
+        cameraReadySent = false
+        for (sec in intArrayOf(4, 8, 15)) {
+            mainHandler.postDelayed({
+                if (cameraReadySent) return@postDelayed
+                diag("watchdog",
+                    "camera STILL not ready after ${sec}s — previewView=${previewView.width}x${previewView.height}, " +
+                        "initialized=$isCameraInitialized, provider=${cameraProvider != null}, paused=$isCameraPausedManually. " +
+                        "This is the blank-preview state.")
+            }, sec * 1000L)
+        }
+    }
+
     init {
         previewView = PreviewView(context)
         previewView.post {
@@ -112,8 +139,10 @@ class CameraPlatformView(
                 surfaceView.holder.setFormat(PixelFormat.TRANSPARENT)
                 surfaceView.setZOrderMediaOverlay(true)
                 Log.d(TAG, "SurfaceView settings applied for viewId $viewId.")
+                diag("surface", "SurfaceView found; applied TRANSPARENT + ZOrderMediaOverlay (child0=${previewView.getChildAt(0)?.javaClass?.simpleName})")
             } else {
                 Log.e(TAG, "Could not find SurfaceView inside PreviewView for viewId $viewId.")
+                diag("surface", "WARNING no SurfaceView child (child0=${previewView.getChildAt(0)?.javaClass?.simpleName}) — preview may render incorrectly")
             }
         }
 
@@ -167,15 +196,33 @@ class CameraPlatformView(
         })
 
         setupTapToFocus()
+
+        diag("init", "created (lens=${if (currentLensFacing == CameraSelector.LENS_FACING_FRONT) "front" else "back"}, " +
+            "fit=$currentPreviewFitStr, detection=$detectionEnabled, bypassPerm=$bypassPermissionCheck)")
+        // A zero-size PreviewView is a direct cause of a blank preview; log size changes.
+        previewView.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or_, ob ->
+            val nw = r - l; val nh = b - t
+            val ow = or_ - ol; val oh = ob - ot
+            if (nw != ow || nh != oh) {
+                diag("layout", "previewView size ${nw}x$nh" +
+                    if (nw == 0 || nh == 0) " — WARNING zero-size (blank preview)" else "")
+            }
+        }
     }
 
     override fun onResume(owner: LifecycleOwner) {
         super.onResume(owner)
+        diag("lifecycle", "onResume (dialogShowing=$isDialogShowing, initialized=$isCameraInitialized, paused=$isCameraPausedManually)")
         // If our dialog is currently showing, do nothing
         if (isDialogShowing) return
 
         // Check permissions
         checkPermissionsAndSetup()
+    }
+
+    override fun onPause(owner: LifecycleOwner) {
+        super.onPause(owner)
+        diag("lifecycle", "onPause")
     }
 
     private fun findActivity(): Activity? {
@@ -191,6 +238,8 @@ class CameraPlatformView(
 
     // Fully updated permission-checking logic
     private fun checkPermissionsAndSetup() {
+        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        diag("perm", "check: granted=$granted, bypass=$bypassPermissionCheck, initialized=$isCameraInitialized")
         if (bypassPermissionCheck) {
             setupCamera()
             return
@@ -264,6 +313,8 @@ class CameraPlatformView(
         when (call.method) {
             "initialize" -> {
                 Log.d(TAG, "Initialization requested from Flutter for viewId $viewId.")
+                diag("method", "initialize requested")
+                scheduleReadyWatchdog()
                 checkPermissionsAndSetup()
                 result.success(null)
             }
@@ -353,17 +404,21 @@ class CameraPlatformView(
     }
 
     private fun setupCamera() {
+        diag("setup", "requesting ProcessCameraProvider")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             try {
                 cameraProvider = cameraProviderFuture.get()
+                diag("setup", "provider obtained (paused=$isCameraPausedManually)")
                 if (!isCameraPausedManually) {
                     bindCameraUseCases(cameraProvider!!)
                 } else {
                     Log.d(TAG, "Camera for viewId $viewId is manually paused, not binding use cases on setup.")
+                    diag("setup", "paused — not binding use cases")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to get ProcessCameraProvider for viewId $viewId: ${e.message}", e)
+                diag("setup", "FAILED to get provider: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(context))
     }
@@ -388,6 +443,7 @@ class CameraPlatformView(
     }
 
     private fun bindCameraUseCases(cameraProvider: ProcessCameraProvider) {
+        diag("bind", "begin (previewView=${previewView.width}x${previewView.height}, paused=$isCameraPausedManually, detection=$detectionEnabled)")
         applyPreviewFit()
         cameraProvider.unbindAll()
 
@@ -498,10 +554,13 @@ class CameraPlatformView(
                 )
             }
             Log.d(TAG, "Camera use cases bound for viewId $viewId. Paused: $isCameraPausedManually")
+            cameraReadySent = true
+            diag("ready", "bound OK, sending onCameraReady (camera=${camera != null}, previewView=${previewView.width}x${previewView.height})")
             isCameraInitialized = true
             methodChannel.invokeMethod("onCameraReady", null)
         } catch (exc: Exception) {
             Log.e(TAG, "Failed to bind camera use cases for viewId $viewId: ${exc.message}", exc)
+            diag("bind", "FAILED: ${exc.message} — sending onCameraError")
             this.camera = null
             isCameraInitialized = false
 
@@ -512,6 +571,7 @@ class CameraPlatformView(
 
     private fun pauseCameraNative(result: MethodChannel.Result) {
         Log.d(TAG, "Pausing camera for viewId $viewId (only unbinding preview)")
+        diag("method", "pauseCamera")
         isCameraPausedManually = true
         try {
             previewUseCase?.let { currentPreviewUseCase ->
@@ -531,11 +591,14 @@ class CameraPlatformView(
 
     private fun resumeCameraNative(result: MethodChannel.Result) {
         Log.d(TAG, "Resuming camera for viewId $viewId")
+        diag("method", "resumeCamera")
+        scheduleReadyWatchdog()
         isCameraPausedManually = false
         if (cameraProvider != null) {
             bindCameraUseCases(cameraProvider!!)
         } else {
             Log.w(TAG, "CameraProvider not available yet for viewId $viewId on resume.")
+            diag("method", "resume: provider not ready yet")
         }
         result.success(null)
     }
@@ -934,6 +997,7 @@ class CameraPlatformView(
 
     override fun dispose() {
         Log.d(TAG, "Disposing CameraPlatformView for viewId $viewId")
+        diag("lifecycle", "dispose")
         lifecycleOwner.lifecycle.removeObserver(this)
         isCameraPausedManually = false
         isCameraInitialized = false

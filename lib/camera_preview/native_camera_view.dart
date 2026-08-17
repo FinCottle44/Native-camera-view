@@ -107,9 +107,20 @@ class NativeCameraView extends StatefulWidget {
 
 class _NativeCameraViewState extends State<NativeCameraView> {
   CameraController? _controller;
+  bool? _lastLoadingLogged;
+
+  @override
+  void initState() {
+    super.initState();
+    ncvLog('widget',
+        'NativeCameraView initState (platform=${Platform.operatingSystem}, '
+        'enableDetection=${widget.enableDetection}, fit=${widget.cameraPreviewFit?.name ?? 'cover'}, '
+        'front=${widget.isFrontCamera ?? false}, bypassPerm=${widget.bypassPermissionCheck ?? false})');
+  }
 
   @override
   void dispose() {
+    ncvLog('widget', 'NativeCameraView dispose');
     _controller?.dispose();
     super.dispose();
   }
@@ -127,6 +138,10 @@ class _NativeCameraViewState extends State<NativeCameraView> {
           Platform.isIOS ? '${detectionBase}_ios_$id' : '${detectionBase}_$id';
       detectionChannel = EventChannel(detectionChannelName);
     }
+
+    ncvLog('widget',
+        'platform view created (id=$id) — wiring method channel "$channelName"'
+        '${detectionChannel != null ? ' + detection channel' : ''}');
 
     // Use setState to assign the controller and rebuild the widget
     setState(() {
@@ -180,6 +195,15 @@ class _NativeCameraViewState extends State<NativeCameraView> {
           ValueListenableBuilder<bool>(
             valueListenable: _controller!.isLoading,
             builder: (context, isLoading, _) {
+              if (_lastLoadingLogged != isLoading) {
+                _lastLoadingLogged = isLoading;
+                ncvLog(
+                    'widget',
+                    isLoading
+                        ? 'loading overlay: SHOWING spinner (camera not ready)'
+                        : 'loading overlay: HIDDEN — native preview should be visible now. '
+                            'If the area is blank here, the native session/preview did not render.');
+              }
               if (isLoading) {
                 return Positioned.fill(
                   child: widget.loadingWidget ?? const Center(child: CircularProgressIndicator()),

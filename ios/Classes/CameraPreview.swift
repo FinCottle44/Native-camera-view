@@ -14,6 +14,9 @@ class CameraHostView: UIView {
     /// in immediately when a car is (re)acquired.
     var fadeOutDuration: CFTimeInterval = 0.2
 
+    // Diagnostics: only log when the layout actually changes (avoids spam).
+    private var lastLoggedBounds: CGRect = .zero
+
     // Translucent "ground guide" fill, drawn below the box. A gradient (opaque
     // at the ground-side edge, fading to transparent as it meets the car) is
     // masked to a shape: the ground strip with the car region punched out
@@ -54,6 +57,14 @@ class CameraHostView: UIView {
         groundGuideMask.frame = self.bounds
         groundGuideGradient.mask = groundGuideMask
         detectionBoxLayer.frame = self.bounds
+
+        // Diagnostics: a zero-size host view or a nil preview layer here means a
+        // blank preview. Only log on change to keep it quiet.
+        if self.bounds != lastLoggedBounds {
+            lastLoggedBounds = self.bounds
+            let pl = previewLayer
+            print("NCVDIAG [ios hostview] layoutSubviews bounds=\(self.bounds) previewLayer=\(pl != nil ? "attached(frame=\(pl!.frame))" : "NIL")\(self.bounds.isEmpty ? " — WARNING zero-size view" : "")")
+        }
     }
 
     /// Draws (or clears) the translucent ground band. Glides with the box.
@@ -207,6 +218,14 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     private var isDeinitializing = false
     private var lastPausedFrameCGImage: CGImage?
 
+    // --- Diagnostics (NCVDIAG): trace the preview lifecycle to catch the
+    // intermittent blank-preview issue. Filter device logs by "NCVDIAG".
+    private let createdAt: CFTimeInterval = CACurrentMediaTime()
+    private var cameraReadySent = false
+    private var framesReceivedTotal = 0
+    private var framesSinceHeartbeat = 0
+    private var lastFrameHeartbeat: CFTimeInterval = 0
+
     private var videoDataOutput: AVCaptureVideoDataOutput?
     private let videoDataOutputQueue = DispatchQueue(label: "com.plugin.camera_native.native_camera_view.videoDataOutputQueue.view-\(UUID().uuidString)", qos: .userInitiated)
     private var lastFrameAsUIImage: UIImage?
@@ -323,9 +342,72 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         })
         
         print("[CameraPlatformView-\(viewId)] Parsed arguments: fitMode=\(self.currentPreviewFit), useFront=\(self.currentCameraPosition == .front)")
+        diag("init", "created (lens=\(currentCameraPosition == .front ? "front" : "back"), fit=\(currentPreviewFit), detection=\(detectionEnabled), bypassPerm=\(bypassPermissionCheck))")
     }
 
     func view() -> UIView { return _hostView }
+
+    // MARK: - Diagnostics (NCVDIAG)
+
+    /// Emits one tagged, elapsed-timestamped diagnostic line. Filter device logs
+    /// by "NCVDIAG" to trace the whole preview lifecycle across Dart + native.
+    private func diag(_ area: String, _ message: String) {
+        let t = String(format: "%.3f", CACurrentMediaTime() - createdAt)
+        print("NCVDIAG +\(t)s [ios view \(viewId)] [\(area)] \(message)")
+    }
+
+    /// Registers observers for the AVCaptureSession notifications that are the
+    /// usual causes of a suddenly-blank preview (interruptions, runtime errors).
+    /// Scoped to [session] so we only hear about the current session.
+    private func registerSessionObservers(_ session: AVCaptureSession) {
+        let nc = NotificationCenter.default
+        nc.removeObserver(self) // clear any observers from a previous session
+        nc.addObserver(self, selector: #selector(sessionRuntimeError(_:)),
+                       name: .AVCaptureSessionRuntimeError, object: session)
+        nc.addObserver(self, selector: #selector(sessionWasInterrupted(_:)),
+                       name: .AVCaptureSessionWasInterrupted, object: session)
+        nc.addObserver(self, selector: #selector(sessionInterruptionEnded(_:)),
+                       name: .AVCaptureSessionInterruptionEnded, object: session)
+        nc.addObserver(self, selector: #selector(sessionDidStartRunning(_:)),
+                       name: .AVCaptureSessionDidStartRunning, object: session)
+        nc.addObserver(self, selector: #selector(sessionDidStopRunning(_:)),
+                       name: .AVCaptureSessionDidStopRunning, object: session)
+        diag("session", "observers registered")
+    }
+
+    @objc private func sessionRuntimeError(_ n: Notification) {
+        let err = n.userInfo?[AVCaptureSessionErrorKey]
+        diag("session", "RUNTIME ERROR: \(String(describing: err)) — preview will blank until the session recovers")
+    }
+
+    @objc private func sessionWasInterrupted(_ n: Notification) {
+        var reasonStr = "unknown"
+        if let raw = n.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int {
+            let name: String
+            switch raw {
+            case 1: name = "videoDeviceNotAvailableInBackground"
+            case 2: name = "audioDeviceInUseByAnotherClient"
+            case 3: name = "videoDeviceInUseByAnotherClient"
+            case 4: name = "videoDeviceNotAvailableWithMultipleForegroundApps"
+            case 5: name = "videoDeviceNotAvailableDueToSystemPressure"
+            default: name = "other"
+            }
+            reasonStr = "\(raw) (\(name))"
+        }
+        diag("session", "INTERRUPTED reason=\(reasonStr) — THIS BLANKS THE PREVIEW")
+    }
+
+    @objc private func sessionInterruptionEnded(_ n: Notification) {
+        diag("session", "interruption ended — preview should resume; isRunning=\(captureSession?.isRunning ?? false)")
+    }
+
+    @objc private func sessionDidStartRunning(_ n: Notification) {
+        diag("session", "didStartRunning")
+    }
+
+    @objc private func sessionDidStopRunning(_ n: Notification) {
+        diag("session", "didStopRunning (preview goes blank while stopped)")
+    }
 
     private func checkCameraPermissionsAndSetup() {
         print("[CameraPlatformView-\(viewId)] checkCameraPermissionsAndSetup CALLED")
@@ -333,6 +415,8 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             print("[CameraPlatformView-\(viewId)] checkCameraPermissionsAndSetup: Instance is deinitializing, aborting.")
             return
         }
+
+        diag("perm", "authStatus=\(AVCaptureDevice.authorizationStatus(for: .video).rawValue), bypass=\(bypassPermissionCheck)")
 
         //  Check the bypass flag first
         if bypassPermissionCheck {
@@ -411,6 +495,10 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             let newSession = AVCaptureSession()
             strongSelf.captureSession = newSession
             newSession.sessionPreset = .photo
+            strongSelf.cameraReadySent = false
+            strongSelf.framesReceivedTotal = 0
+            strongSelf.registerSessionObservers(newSession)
+            strongSelf.diag("setup", "begin (lens=\(targetLens == .front ? "front" : "back"), paused=\(strongSelf.isCameraPausedManually))")
 
             var configurationSuccess = true
             var setupError: Error? // Variable to hold the error if any
@@ -466,6 +554,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
 
             guard configurationSuccess else {
                 print("[CameraPlatformView-\(viewId)] setupCamera: Configuration failed. Cleaning up and sending error to Flutter.")
+                strongSelf.diag("setup", "CONFIGURATION FAILED: \(setupError?.localizedDescription ?? "unknown") — sending onCameraError")
                 // Send an error signal back to Flutter
                 let errorMessage = setupError?.localizedDescription ?? "Unknown configuration error."
                 DispatchQueue.main.async {
@@ -482,9 +571,11 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 if strongSelf.captureSession === newSession && !newSession.isRunning {
                     newSession.startRunning()
                     print("[CameraPlatformView-\(viewId)] setupCamera: newSession started for \(targetLens).")
+                    strongSelf.diag("setup", "startRunning called; session.isRunning=\(newSession.isRunning)")
                 }
             } else {
                 print("[CameraPlatformView-\(viewId)] setupCamera: Camera manually paused, not starting session for \(targetLens).")
+                strongSelf.diag("setup", "paused — session NOT started")
             }
 
             DispatchQueue.main.async {
@@ -496,9 +587,26 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
                 sSelf._hostView.layer.insertSublayer(previewLayer, at: 0)
                 sSelf._hostView.setNeedsLayout()
                 print("[CameraPlatformView-\(sSelf.viewId)] setupCamera: Preview layer configured for \(targetLens).")
+                sSelf.diag("setup", "preview layer attached (hostView.bounds=\(sSelf._hostView.bounds), gravity=\(previewLayer.videoGravity.rawValue))")
 
                 // Send the camera-ready signal back to Flutter
+                sSelf.cameraReadySent = true
+                sSelf.diag("ready", "sending onCameraReady")
                 sSelf.methodChannel?.invokeMethod("onCameraReady", arguments: nil)
+
+                // Native watchdog: 5s later, confirm the session is actually
+                // running and frames are flowing. If not, the preview is blank.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak sSelf] in
+                    guard let s = sSelf, !s.isDeinitializing else { return }
+                    let running = s.captureSession?.isRunning ?? false
+                    let hasLayer = (s._hostView.previewLayer != nil)
+                    if !running || s.framesReceivedTotal == 0 || !hasLayer || s._hostView.bounds.isEmpty {
+                        s.diag("watchdog",
+                               "5s check FAILED: isRunning=\(running), frames=\(s.framesReceivedTotal), previewLayer=\(hasLayer), bounds=\(s._hostView.bounds) — this is the blank-preview state")
+                    } else {
+                        s.diag("watchdog", "5s check OK: isRunning=true, frames=\(s.framesReceivedTotal)")
+                    }
+                }
             }
         }
     }
@@ -521,6 +629,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         switch call.method {
         case "initialize":
                 print("[CameraPlatformView-\(viewId)] Initialization requested from Flutter.")
+                diag("method", "initialize requested")
                 checkCameraPermissionsAndSetup()
                 result(nil)
         case "captureImage": capturePhoto(result: result)
@@ -874,6 +983,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     
     private func pauseCameraNative(result: @escaping FlutterResult) {
         print("[CameraPlatformView-\(viewId)] pauseCameraNative called.")
+        diag("method", "pauseCamera")
         isCameraPausedManually = true
         
         // On pause, we stop the session. `lastPausedFrameImage` is still retained.
@@ -904,6 +1014,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
 
     private func resumeCameraNative(result: @escaping FlutterResult) {
         print("[CameraPlatformView-\(viewId)] resumeCameraNative called.")
+        diag("method", "resumeCamera")
         guard !isDeinitializing else {
             result(FlutterError(code: "INSTANCE_GONE", message: "Resuming on deinitializing instance", details: nil))
             return
@@ -927,6 +1038,21 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     ) {
         guard !isDeinitializing, output == self.videoDataOutput else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // Frame heartbeat: proof that frames are actually flowing. If these lines
+        // go quiet while the app is foregrounded, the preview has stalled — line
+        // it up against the session interruption/runtime-error logs.
+        framesReceivedTotal += 1
+        framesSinceHeartbeat += 1
+        let hbNow = CACurrentMediaTime()
+        if lastFrameHeartbeat == 0 {
+            lastFrameHeartbeat = hbNow
+            diag("frames", "first frame received (preview should be live)")
+        } else if hbNow - lastFrameHeartbeat >= 2.0 {
+            diag("frames", "\(framesSinceHeartbeat) frames in last \(String(format: "%.1f", hbNow - lastFrameHeartbeat))s (total=\(framesReceivedTotal))")
+            lastFrameHeartbeat = hbNow
+            framesSinceHeartbeat = 0
+        }
 
         // Keep a recent full-res frame for paused capture, but throttled. Doing
         // this every frame at photo resolution was a major source of jank.
@@ -1356,6 +1482,8 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
     }
     deinit {
         isDeinitializing = true
+        NotificationCenter.default.removeObserver(self)
+        diag("deinit", "tearing down view")
         let currentViewId = self.viewId
         print("[CameraPlatformView-\(currentViewId)] DEINIT: Running on thread: \(Thread.current)")
         print("[CameraPlatformView-\(currentViewId)] DEINIT: Starting the deallocation process.")
