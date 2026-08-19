@@ -1104,7 +1104,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             options.scoreThreshold = detectionMinConfidence
             // NOTE: no categoryAllowlist — a single-category allowlist crashes the
             // GPU delegate ("Only all classes >= class 0 or >= class 1"). We filter
-            // to "car" in code instead (see detectLargestCar).
+            // to "car" in code instead (see selectPrimaryCar).
             options.maxResults = 25
             return try ObjectDetector(options: options)
         }
@@ -1125,9 +1125,21 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         }
     }
 
-    /// Runs the detector on one (already-oriented) image and returns the largest
-    /// car box normalized (0..1, top-left) to THAT image's own dimensions.
-    private func detectLargestCar(
+    // --- Composite scoring constants (mirrors Android SubjectDetectionAnalyzer) ---
+    private let weightArea: CGFloat = 0.35
+    private let weightCenter: CGFloat = 0.30
+    private let weightConfidence: CGFloat = 0.15
+    private let weightContinuity: CGFloat = 0.20
+    private let continuityIoUThreshold: CGFloat = 0.3
+    private let minRelativeArea: CGFloat = 0.02 // noise filter
+    /// Normalized rect of the previously-selected car (for continuity scoring).
+    private var lastSelectedDetectionRect: CGRect?
+
+    /// Runs the detector on one (already-oriented) image and returns the most
+    /// prominent car box using composite scoring (area + center proximity +
+    /// confidence + tracking continuity). Normalized (0..1, top-left) to the
+    /// image's own dimensions.
+    private func selectPrimaryCar(
         in ciImage: CIImage
     ) -> (rect: CGRect, label: String, confidence: Double)? {
         guard let detector = objectDetector else { return nil }
@@ -1135,6 +1147,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         let w = CGFloat(cg.width)
         let h = CGFloat(cg.height)
         guard w > 0, h > 0 else { return nil }
+        let frameArea = w * h
         let result: ObjectDetectorResult
         do {
             result = try detector.detect(image: try MPImage(uiImage: UIImage(cgImage: cg)))
@@ -1142,19 +1155,82 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
             print("[CameraPlatformView-\(viewId)] Detection failed: \(error.localizedDescription)")
             return nil
         }
-        // Filter to cars in code (a category allowlist crashes the GPU delegate).
-        let cars = result.detections.filter { $0.categories.first?.categoryName == "car" }
-        guard let best = cars.max(by: {
-            ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-        }) else { return nil }
-        let bb = best.boundingBox
+        // Filter to cars and apply minimum area noise filter.
+        let candidates = result.detections.filter { det in
+            guard det.categories.first?.categoryName == "car" else { return false }
+            let bb = det.boundingBox
+            let relativeArea = (bb.width * bb.height) / frameArea
+            return relativeArea >= minRelativeArea
+        }
+        guard !candidates.isEmpty else {
+            lastSelectedDetectionRect = nil
+            return nil
+        }
+
+        // Find the max area for normalization.
+        let maxArea = candidates.map { $0.boundingBox.width * $0.boundingBox.height }.max() ?? 1
+
+        // Score each candidate with composite weights.
+        var bestScore: CGFloat = -1
+        var bestDetection: Detection?
+        var bestNormRect: CGRect?
+
+        for det in candidates {
+            let bb = det.boundingBox
+            let area = bb.width * bb.height
+            let conf = CGFloat(det.categories.first?.score ?? 0)
+
+            // Normalize area to 0..1 relative to the largest candidate.
+            let areaNorm = maxArea > 0 ? area / maxArea : 0
+
+            // Center proximity: 1.0 = dead center, 0.0 = corner.
+            let centerX = bb.midX / w
+            let centerY = bb.midY / h
+            let distFromCenter = sqrt(pow(centerX - 0.5, 2) + pow(centerY - 0.5, 2))
+            // Max possible distance ≈ 0.707
+            let centerNorm = max(0, min(1, 1.0 - (distFromCenter / 0.707)))
+
+            // Continuity: IoU with previously-selected car.
+            let normRect = CGRect(x: bb.minX / w, y: bb.minY / h, width: bb.width / w, height: bb.height / h)
+            let continuityNorm: CGFloat
+            if let prev = lastSelectedDetectionRect {
+                let iou = computeIoU(normRect, prev)
+                continuityNorm = iou >= continuityIoUThreshold ? 1.0 : (iou / continuityIoUThreshold)
+            } else {
+                continuityNorm = 0
+            }
+
+            // Composite score.
+            let score = weightArea * areaNorm +
+                        weightCenter * centerNorm +
+                        weightConfidence * conf +
+                        weightContinuity * continuityNorm
+
+            if score > bestScore {
+                bestScore = score
+                bestDetection = det
+                bestNormRect = normRect
+            }
+        }
+
+        guard let best = bestDetection, let normRect = bestNormRect else { return nil }
+        lastSelectedDetectionRect = normRect
         let cat = best.categories.first
-        return (
-            CGRect(x: bb.minX / w, y: bb.minY / h, width: bb.width / w, height: bb.height / h),
-            cat?.categoryName ?? "car",
-            Double(cat?.score ?? 0)
-        )
+        return (normRect, cat?.categoryName ?? "car", Double(cat?.score ?? 0))
+    }
+
+    /// Computes Intersection-over-Union of two normalized rects.
+    private func computeIoU(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let interLeft = max(a.minX, b.minX)
+        let interTop = max(a.minY, b.minY)
+        let interRight = min(a.maxX, b.maxX)
+        let interBottom = min(a.maxY, b.maxY)
+        let interArea = max(0, interRight - interLeft) * max(0, interBottom - interTop)
+        if interArea <= 0 { return 0 }
+        let aArea = a.width * a.height
+        let bArea = b.width * b.height
+        let unionArea = aArea + bArea - interArea
+        return unionArea > 0 ? interArea / unionArea : 0
     }
 
     /// Maps a normalized rect detected in an image that was produced by applying
@@ -1216,7 +1292,7 @@ class CameraPlatformView: NSObject, FlutterPlatformView,
         for idx in order {
             let orientation = detectionOrientationCandidates[idx]
             let image = (orientation == .up) ? baseCI : baseCI.oriented(orientation)
-            if let found = detectLargestCar(in: image) {
+            if let found = selectPrimaryCar(in: image) {
                 rawRect = unrotateNormalizedRect(found.rect, from: orientation)
                 label = found.label
                 confidence = found.confidence

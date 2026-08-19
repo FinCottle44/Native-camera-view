@@ -23,10 +23,22 @@ Key properties:
   closed-source apps). Float16 (not int8) is used so the MediaPipe **GPU/Metal**
   delegate can run it — the int8 build only runs on CPU.
 - **Opt-in.** Nothing runs unless you pass `enableDetection: true`.
-- **Single, stable box.** Only the largest car is emitted, and the box is
-  temporally smoothed (EMA + a short hold on missed frames) so it tracks smoothly
-  instead of flickering. On iOS the smoothing is native; on Android it runs in
-  the Dart controller.
+- **Single, stable box.** When multiple cars are detected, a composite scoring
+  function selects the most prominent one — not simply the largest. The score
+  combines four weighted factors:
+    1. **Relative area (35%)** — larger cars score higher, but size alone won't
+       win if the car is off to the side.
+    2. **Center proximity (30%)** — cars closer to the frame center are strongly
+       preferred, since the user typically points the camera at their subject.
+    3. **Detection confidence (15%)** — the model's own confidence score; closer,
+       clearer cars tend to score higher.
+    4. **Tracking continuity (20%)** — the previously-selected car receives a
+       bonus (based on IoU overlap with the last frame's selection), so the box
+       doesn't jump between cars frame-to-frame even when scores are close.
+
+  The resulting box is temporally smoothed (EMA + a short hold on missed frames)
+  so it tracks smoothly instead of flickering. On iOS the smoothing is native; on
+  Android it runs in the Dart controller.
 - **Graceful fade-out.** When the car finally leaves the frame, the overlay (box
   + ground guide) fades out over `detectionFadeDuration` (default 200ms) instead
   of vanishing abruptly, and snaps back to full opacity the instant a car is
@@ -60,7 +72,7 @@ Tasks Vision** `ObjectDetector`, so behaviour is consistent.
 | Frame source | CameraX `ImageAnalysis` (RGBA) | existing `AVCaptureVideoDataOutput` |
 | Min OS | API 24 | iOS 13 |
 | Class filter | `car`, filtered in code | `car`, filtered in code |
-| Primary box | largest detected car | largest detected car |
+| Primary box | composite-scored car (area + center + confidence + continuity) | composite-scored car (area + center + confidence + continuity) |
 | Orientation | single-pass `.up` (landscape-left; configurable) | single-pass `.up` (landscape-left; configurable) |
 | Box drawing | Dart `CustomPaint` overlay | native `CAShapeLayer` on the preview |
 | Smoothing | Dart controller (EMA) | native (EMA + grace frames) |

@@ -27,8 +27,15 @@ import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
  * different holding, change that constant (or search several rotations, at the
  * cost of extra inference while searching).
  *
- * Only the `car` category is kept, and only the single most prominent (largest)
- * car is emitted. Detection is advisory only; it never affects image capture.
+ * Only the `car` category is kept. When multiple cars are detected, a composite
+ * score selects the most prominent one based on:
+ *   1. Relative area (larger = more prominent, but not the sole factor).
+ *   2. Center proximity (cars closer to frame center are preferred).
+ *   3. Detection confidence (higher model confidence = preferred).
+ *   4. Tracking continuity / hysteresis (the previously-selected car gets a
+ *      bonus so the box doesn't jump between cars frame-to-frame).
+ *
+ * Detection is advisory only; it never affects image capture.
  */
 class SubjectDetectionAnalyzer(
     context: Context,
@@ -50,9 +57,27 @@ class SubjectDetectionAnalyzer(
         // upright for the model. 270 = landscape-left; use 90 for the mirror
         // (landscape-right), or 0 to detect on the upright frame (portrait).
         private const val DETECTION_ROTATION_DEGREES = 270
+
+        // --- Composite scoring weights ---
+        // How much relative area contributes to the score.
+        private const val WEIGHT_AREA = 0.35f
+        // How much proximity to the frame center contributes.
+        private const val WEIGHT_CENTER = 0.30f
+        // How much model confidence contributes.
+        private const val WEIGHT_CONFIDENCE = 0.15f
+        // How much overlap with the previously-selected car contributes
+        // (tracking hysteresis to prevent jumping).
+        private const val WEIGHT_CONTINUITY = 0.20f
+        // IoU threshold above which a detection is considered "the same car" as
+        // the previous selection (for continuity bonus).
+        private const val CONTINUITY_IOU_THRESHOLD = 0.3f
     }
 
     private var detector: ObjectDetector? = null
+
+    /** Normalized rect of the previously-selected car (in detection bitmap space). */
+    @Volatile
+    private var lastSelectedRect: RectF? = null
 
     init {
         try {
@@ -64,7 +89,7 @@ class SubjectDetectionAnalyzer(
                 .setRunningMode(RunningMode.IMAGE)
                 .setScoreThreshold(SCORE_THRESHOLD)
                 // No category allowlist — a single-category allowlist crashes the
-                // GPU delegate; filter to "car" in code (see detectLargestCar).
+                // GPU delegate; filter to "car" in code (see selectPrimaryCar).
                 .setMaxResults(25)
                 .build()
             detector = ObjectDetector.createFromOptions(context, options)
@@ -116,7 +141,7 @@ class SubjectDetectionAnalyzer(
             } else {
                 rotateBitmap(displayBitmap, DETECTION_ROTATION_DEGREES)
             }
-            val found = detectLargestCar(activeDetector, candidate)
+            val found = selectPrimaryCar(activeDetector, candidate)
             val displayDetection = found?.let {
                 it.copy(rect = unrotateNormalizedRect(it.rect, DETECTION_ROTATION_DEGREES))
             }
@@ -145,31 +170,94 @@ class SubjectDetectionAnalyzer(
         }
     }
 
-    /** Runs the detector on one bitmap; returns the largest car normalized to it. */
-    private fun detectLargestCar(detector: ObjectDetector, bitmap: Bitmap): NormalizedDetection? {
+    /**
+     * Runs the detector on one bitmap and selects the most prominent car using a
+     * composite score that considers area, center proximity, confidence, and
+     * continuity with the previous selection. This prevents the box from jumping
+     * to background/parked cars that happen to be large in the frame.
+     */
+    private fun selectPrimaryCar(detector: ObjectDetector, bitmap: Bitmap): NormalizedDetection? {
         val w = bitmap.width.toFloat()
         val h = bitmap.height.toFloat()
         if (w <= 0f || h <= 0f) return null
         val frameArea = w * h
 
         val result = detector.detect(BitmapImageBuilder(bitmap).build())
-        val primary = result.detections()
+        val candidates = result.detections()
             .filter { det ->
                 val box = det.boundingBox()
                 val relativeArea = if (frameArea > 0f) (box.width() * box.height()) / frameArea else 0f
                 val isCar = det.categories().firstOrNull()?.categoryName() == TARGET_LABEL
                 isCar && relativeArea >= MIN_RELATIVE_AREA
             }
-            .maxByOrNull { it.boundingBox().width() * it.boundingBox().height() }
-            ?: return null
 
-        val box = primary.boundingBox()
+        if (candidates.isEmpty()) {
+            lastSelectedRect = null
+            return null
+        }
+
+        // Find the maximum area among candidates for normalization.
+        val maxArea = candidates.maxOf { it.boundingBox().width() * it.boundingBox().height() }
+
+        val scored = candidates.map { det ->
+            val box = det.boundingBox()
+            val area = box.width() * box.height()
+            val confidence = det.categories().firstOrNull()?.score()?.toDouble() ?: 0.0
+
+            // Normalize area to 0..1 relative to the largest candidate.
+            val areaNorm = if (maxArea > 0f) area / maxArea else 0f
+
+            // Center proximity: 1.0 = dead center, 0.0 = in the corner.
+            val centerX = (box.left + box.right) / 2f / w
+            val centerY = (box.top + box.bottom) / 2f / h
+            // Max possible distance from center is sqrt(0.5² + 0.5²) ≈ 0.707
+            val distFromCenter = Math.sqrt(
+                ((centerX - 0.5) * (centerX - 0.5) + (centerY - 0.5) * (centerY - 0.5)).toDouble()
+            )
+            val centerNorm = (1.0 - (distFromCenter / 0.707)).coerceIn(0.0, 1.0)
+
+            // Continuity: how much this detection overlaps with the previously
+            // selected car. Full bonus if IoU > threshold, partial otherwise.
+            val normalizedRect = RectF(box.left / w, box.top / h, box.right / w, box.bottom / h)
+            val continuityNorm = lastSelectedRect?.let { prev ->
+                val iou = computeIoU(normalizedRect, prev)
+                if (iou >= CONTINUITY_IOU_THRESHOLD) 1.0 else (iou / CONTINUITY_IOU_THRESHOLD).toDouble()
+            } ?: 0.0
+
+            // Composite score.
+            val score = (WEIGHT_AREA * areaNorm +
+                    WEIGHT_CENTER * centerNorm.toFloat() +
+                    WEIGHT_CONFIDENCE * confidence.toFloat() +
+                    WEIGHT_CONTINUITY * continuityNorm.toFloat()).toDouble()
+
+            Triple(det, normalizedRect, score)
+        }
+
+        val (primary, primaryRect, _) = scored.maxByOrNull { it.third } ?: return null
+
+        // Update tracking state for next frame.
+        lastSelectedRect = primaryRect
+
         val category = primary.categories().firstOrNull()
         return NormalizedDetection(
-            rect = RectF(box.left / w, box.top / h, box.right / w, box.bottom / h),
+            rect = primaryRect,
             label = category?.categoryName() ?: TARGET_LABEL,
             confidence = category?.score()?.toDouble() ?: 0.0
         )
+    }
+
+    /** Computes Intersection-over-Union of two normalized rects. */
+    private fun computeIoU(a: RectF, b: RectF): Float {
+        val interLeft = maxOf(a.left, b.left)
+        val interTop = maxOf(a.top, b.top)
+        val interRight = minOf(a.right, b.right)
+        val interBottom = minOf(a.bottom, b.bottom)
+        val interArea = maxOf(0f, interRight - interLeft) * maxOf(0f, interBottom - interTop)
+        if (interArea <= 0f) return 0f
+        val aArea = (a.right - a.left) * (a.bottom - a.top)
+        val bArea = (b.right - b.left) * (b.bottom - b.top)
+        val unionArea = aArea + bArea - interArea
+        return if (unionArea > 0f) interArea / unionArea else 0f
     }
 
     /**
